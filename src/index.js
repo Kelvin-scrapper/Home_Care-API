@@ -1,4 +1,11 @@
 require('dotenv').config();
+
+// Without this every login would fail with an opaque 500 when signing the token.
+if (!process.env.JWT_SECRET) {
+  console.error('JWT_SECRET is not set — refusing to start. Add it to .env (see .env.example).');
+  process.exit(1);
+}
+
 const express = require('express');
 const cors = require('cors');
 const pool = require('./db');
@@ -10,6 +17,15 @@ const statsRoutes = require('./routes/stats');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Number of reverse proxies in front of the API (e.g. 1 for nginx/Traefik/a
+// platform load balancer). Needed so req.ip — which the login rate limit is
+// keyed on — is the real client, not the proxy. Leave unset if the API is
+// reached directly: trusting X-Forwarded-For there would let clients spoof it.
+const trustProxyHops = Number(process.env.TRUST_PROXY);
+if (Number.isInteger(trustProxyHops) && trustProxyHops > 0) {
+  app.set('trust proxy', trustProxyHops);
+}
 
 app.use(cors({ origin: process.env.FRONTEND_ORIGIN || true }));
 app.use(express.json());
@@ -30,6 +46,13 @@ app.get('/health', async (req, res) => {
 });
 
 app.use((err, req, res, next) => {
+  // Client mistakes from express.json() are 4xx, not server errors.
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Request body must be valid JSON' });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body is too large' });
+  }
   console.error(err);
   res.status(500).json({ error: 'Internal server error' });
 });

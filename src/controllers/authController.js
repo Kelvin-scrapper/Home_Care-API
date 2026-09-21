@@ -3,13 +3,25 @@ const TokenBlacklist = require('../models/TokenBlacklist');
 const { signAccessToken } = require('../utils/jwt');
 
 async function login(req, res) {
-  const { email, password } = req.body;
-  if (!email || !password) {
+  // req.body is undefined when the request has no JSON body / wrong Content-Type.
+  const { email, password } = req.body ?? {};
+  if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
     return res.status(400).json({ error: 'email and password are required' });
   }
+  if (email.length > User.MAX_EMAIL_LENGTH || password.length > User.MAX_PASSWORD_LENGTH) {
+    return res.status(400).json({ error: 'email or password is too long' });
+  }
 
-  const user = await User.findByEmail(email);
-  if (!user || !(await User.verifyPassword(user, password))) {
+  const normalizedEmail = email.trim().toLowerCase();
+  const user = await User.findByEmail(normalizedEmail);
+  const passwordMatches = await User.verifyPassword(user, password);
+
+  if (!user || !passwordMatches) {
+    // The client always gets the same message, so this endpoint can't be used
+    // to discover which emails have accounts. The real reason goes to the log.
+    console.warn(
+      `[auth] failed login (${user ? 'wrong password' : 'unknown email'}) for ${JSON.stringify(normalizedEmail)} from ${req.ip}`
+    );
     return res.status(401).json({ error: 'Invalid email or password' });
   }
 

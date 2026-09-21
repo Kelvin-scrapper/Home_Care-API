@@ -9,6 +9,11 @@ services:
       JWT_SECRET: change-this-to-a-long-random-string
       JWT_EXPIRES_IN: 1h
       FRONTEND_ORIGIN: http://localhost:5173
+      NODE_ENV: ${NODE_ENV:-development}
+      TRUST_PROXY: ${TRUST_PROXY:-}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-}
+      SEED_ADMIN_NAME: ${SEED_ADMIN_NAME:-}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
     depends_on:
       db:
         condition: service_healthy
@@ -25,7 +30,10 @@ services:
       - db_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      # -h 127.0.0.1 forces a TCP check. Without it, pg_isready can pass against
+      # Postgres's temporary init server (unix socket only) before the real
+      # server is up, and the API's startup schema/seed step would fail.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 5
