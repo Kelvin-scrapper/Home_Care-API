@@ -4,9 +4,10 @@ const pool = require('../db');
 const SALT_ROUNDS = 10;
 const ROLES = ['Volunteer/CHW', 'Coordinator/Field officer', 'Admin', 'Management/Director'];
 
-// Shared by login and user creation so an account can always be signed in to.
-// (bcrypt only uses the first 72 bytes anyway.)
+// Shared by login and user creation/editing so an account can always be
+// signed in to. (bcrypt only uses the first 72 bytes anyway.)
 const MAX_EMAIL_LENGTH = 254;
+const MIN_PASSWORD_LENGTH = 8;
 const MAX_PASSWORD_LENGTH = 128;
 
 // Checked against when the email doesn't exist, so a failed login takes about
@@ -40,6 +41,11 @@ async function list() {
   return rows;
 }
 
+async function countByRole(role) {
+  const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM users WHERE role = $1', [role]);
+  return rows[0].count;
+}
+
 async function create({ name, email, password, role }) {
   const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
   const { rows } = await pool.query(
@@ -49,6 +55,29 @@ async function create({ name, email, password, role }) {
     [name, email, passwordHash, role]
   );
   return rows[0];
+}
+
+// Only the fields present in `changes` are touched. `password`, if given, is
+// hashed here. Returns null if the user doesn't exist.
+async function update(id, { name, email, role, password }) {
+  const values = [id];
+  const sets = [];
+  const set = (column, value) => {
+    values.push(value);
+    sets.push(`${column} = $${values.length}`);
+  };
+
+  if (name !== undefined) set('name', name);
+  if (email !== undefined) set('email', email);
+  if (role !== undefined) set('role', role);
+  if (password !== undefined) set('password_hash', await bcrypt.hash(password, SALT_ROUNDS));
+
+  const { rows } = await pool.query(
+    `UPDATE users SET ${sets.join(', ')} WHERE id = $1
+     RETURNING id, name, email, role, created_at AS "createdAt"`,
+    values
+  );
+  return rows[0] || null;
 }
 
 // `user` may be null (unknown email): the dummy comparison still runs, but the
@@ -61,10 +90,13 @@ async function verifyPassword(user, password) {
 module.exports = {
   ROLES,
   MAX_EMAIL_LENGTH,
+  MIN_PASSWORD_LENGTH,
   MAX_PASSWORD_LENGTH,
   findByEmail,
   findById,
   list,
+  countByRole,
   create,
+  update,
   verifyPassword,
 };

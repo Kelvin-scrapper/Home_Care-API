@@ -1,11 +1,14 @@
 // Seeds users. Safe to re-run — upserts by email. Run with `npm run db:seed`,
 // and automatically on container start (see Dockerfile).
 //
-//  1. SEED_ADMIN_EMAIL + SEED_ADMIN_PASSWORD set: only that Admin
-//     (SEED_ADMIN_NAME optional). An override for emergencies or one-off setups.
-//  2. NODE_ENV=production: the accounts listed in db/seed-users.js.
+//  1. SEED_ADMIN_EMAIL + SEED_ADMIN_PASSWORD set: only that Admin, created or
+//     reset to this password every time. The recovery path if an admin is
+//     locked out (SEED_ADMIN_NAME optional).
+//  2. NODE_ENV=production: the accounts listed in db/seed-users.js, but only
+//     on a fresh database (no users yet). After that users are managed in the
+//     app, so redeploys never overwrite edits.
 //  3. Otherwise (local dev): one test account per role, all with the
-//     password "password".
+//     password "password", reset on every run.
 require('dotenv').config();
 const bcrypt = require('bcrypt');
 const pool = require('../src/db');
@@ -56,7 +59,8 @@ function validateUsers(users) {
 
 const { SEED_ADMIN_EMAIL, SEED_ADMIN_PASSWORD, SEED_ADMIN_NAME } = process.env;
 const adminConfigured = Boolean(SEED_ADMIN_EMAIL && SEED_ADMIN_PASSWORD);
-const useTestAccounts = !adminConfigured && process.env.NODE_ENV !== 'production';
+const useFixedUsers = !adminConfigured && process.env.NODE_ENV === 'production';
+const useTestAccounts = !adminConfigured && !useFixedUsers;
 
 async function getSeedUsers() {
   if (adminConfigured) {
@@ -77,6 +81,14 @@ async function getSeedUsers() {
 }
 
 async function main() {
+  if (useFixedUsers) {
+    const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM users');
+    if (rows[0].count > 0) {
+      console.log('Users already exist — leaving them as they are.');
+      return;
+    }
+  }
+
   const users = await getSeedUsers();
   if (users.length === 0) {
     console.log('db/seed-users.js is empty — skipping user seed.');
@@ -84,12 +96,15 @@ async function main() {
   }
   validateUsers(users);
 
+  const onConflict = useFixedUsers
+    ? 'DO NOTHING'
+    : 'DO UPDATE SET name = EXCLUDED.name, password_hash = EXCLUDED.password_hash, role = EXCLUDED.role';
+
   for (const user of users) {
     await pool.query(
       `INSERT INTO users (name, email, password_hash, role)
        VALUES ($1, $2, $3, $4)
-       ON CONFLICT (email) DO UPDATE
-       SET name = EXCLUDED.name, password_hash = EXCLUDED.password_hash, role = EXCLUDED.role`,
+       ON CONFLICT (email) ${onConflict}`,
       [user.name.trim(), user.email.trim().toLowerCase(), user.passwordHash, user.role]
     );
     console.log(`Seeded ${user.email.trim().toLowerCase()} (${user.role})`);

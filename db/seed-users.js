@@ -1,9 +1,10 @@
-// Accounts created on every production start by db/seed.js (NODE_ENV=production).
+// Accounts created by db/seed.js when NODE_ENV=production and the database has
+// no users yet (a fresh install). After that this file is not consulted again:
+// manage users in the app (Admin > Add User / Edit), and redeploys leave them alone.
 // Passwords are stored as bcrypt hashes, so the repo doesn't reveal them.
 //
-// To add or change an account: run `npm run db:hash -- "<password>"` and paste
-// the hash below. Each start syncs these rows by email (name, role and password
-// are reset to what's here); users added through the app are left alone.
+// To change what a fresh install starts with: run `npm run db:hash -- "<password>"`
+// and paste the hash below.
 
 module.exports = [
   {
