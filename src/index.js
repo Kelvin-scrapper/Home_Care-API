@@ -27,7 +27,10 @@ if (Number.isInteger(trustProxyHops) && trustProxyHops > 0) {
   app.set('trust proxy', trustProxyHops);
 }
 
-app.use(cors({ origin: process.env.FRONTEND_ORIGIN || true }));
+const allowedOrigins = process.env.FRONTEND_ORIGIN
+  ? process.env.FRONTEND_ORIGIN.split(',').map((origin) => origin.trim())
+  : true;
+app.use(cors({ origin: allowedOrigins }));
 app.use(express.json());
 
 app.use('/auth', authRoutes);

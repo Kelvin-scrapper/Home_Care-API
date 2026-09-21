@@ -2,14 +2,16 @@ services:
   api:
     build: .
     ports:
-      - "3000:3000"
+      - "8007:3000"
+    env_file:
+      - .env
     environment:
       PORT: 3000
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/home_care_api
-      JWT_SECRET: change-this-to-a-long-random-string
-      JWT_EXPIRES_IN: 1h
-      FRONTEND_ORIGIN: http://localhost:5173
-      NODE_ENV: ${NODE_ENV:-development}
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-home_care_api}
+      # JWT_SECRET, JWT_EXPIRES_IN and FRONTEND_ORIGIN come from .env (env_file above).
+      # Defaults to production so a deploy never auto-creates the dev test
+      # accounts (see db/seed.js). Set NODE_ENV=development in .env to get them.
+      NODE_ENV: ${NODE_ENV:-production}
       TRUST_PROXY: ${TRUST_PROXY:-}
       SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-}
       SEED_ADMIN_NAME: ${SEED_ADMIN_NAME:-}
@@ -22,10 +24,8 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: home_care_api
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-home_care_api}
     volumes:
       - db_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
