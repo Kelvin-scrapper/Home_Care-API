@@ -45,7 +45,13 @@ async function create(req, res) {
     });
   }
 
-  const beneficiaryId = await Beneficiary.findOrCreate(parsed.data);
+  const beneficiaryId = await Beneficiary.findOrCreate({
+    name: parsed.data.beneficiaryName,
+    location: parsed.data.location,
+    age: parsed.data.age,
+    weight: parsed.data.weight,
+    timeInCommunity: parsed.data.timeInCommunity,
+  });
   const visit = await Visit.create({ createdBy: req.user.id, beneficiaryId, data: parsed.data });
 
   res.status(201).json(visit);
