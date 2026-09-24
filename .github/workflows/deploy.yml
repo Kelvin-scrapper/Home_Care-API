@@ -15,6 +15,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Deploy only if every API test passes (in-memory Postgres, no services needed).
+      - run: npm test
       - run: docker build -t home-care-api:ci .
 
   deploy:

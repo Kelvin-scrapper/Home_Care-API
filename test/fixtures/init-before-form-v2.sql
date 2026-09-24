@@ -15,9 +15,8 @@ CREATE TABLE IF NOT EXISTS token_blacklist (
   expires_at TIMESTAMPTZ NOT NULL
 );
 
--- A beneficiary is identified by their BHECO reference number; records from
--- the original form (no reference number) by (name, location) — see the
--- indexes in the formVersion 2 section below. Every later visit for the same person links to this
+-- A beneficiary is identified once, on first visit, by (name, location) — see
+-- the unique index below. Every later visit for the same person links to this
 -- row via visits.beneficiary_id instead of re-deriving identity from
 -- free-text fields, so a typo in one visit can't fork them into two people.
 CREATE TABLE IF NOT EXISTS beneficiaries (
@@ -29,6 +28,11 @@ CREATE TABLE IF NOT EXISTS beneficiaries (
   time_in_community TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Case-insensitive identity key. Used as the ON CONFLICT target for the
+-- find-or-create upsert in src/routes/visits.js.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_beneficiaries_identity
+  ON beneficiaries (lower(name), lower(location));
 
 CREATE TABLE IF NOT EXISTS visits (
   id SERIAL PRIMARY KEY,
@@ -97,52 +101,3 @@ CREATE INDEX IF NOT EXISTS idx_visits_created_by ON visits (created_by);
 CREATE INDEX IF NOT EXISTS idx_visits_beneficiary_id ON visits (beneficiary_id);
 CREATE INDEX IF NOT EXISTS idx_visits_created_at ON visits (created_at);
 CREATE INDEX IF NOT EXISTS idx_visits_urgency_level ON visits (urgency_level);
-
--- ---------------------------------------------------------------------------
--- Digital Data Collection Form (formVersion 2). Additive only: this file is
--- re-applied on every start, and visits recorded with the original form keep
--- their data in the columns above (form_version = 1, form_data NULL).
--- ---------------------------------------------------------------------------
-
--- Full answers for formVersion 2 visits, keyed by field name (see
--- src/schemas/visitFormDefinition.js). The flat columns above are still
--- filled from it (name, location, officer, date, urgency...) so lists,
--- stats and the beneficiary directory work across both form versions.
-ALTER TABLE visits ADD COLUMN IF NOT EXISTS form_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE visits ADD COLUMN IF NOT EXISTS form_data JSONB;
-
--- The BHECO household reference number (e.g. BHECO-NK-001), stored
--- normalized (no spaces, upper case). Identifies beneficiaries from form v2
--- on; older rows have none until a v2 visit links to them.
-ALTER TABLE beneficiaries ADD COLUMN IF NOT EXISTS reference_number TEXT;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_beneficiaries_reference_number
-  ON beneficiaries (reference_number) WHERE reference_number IS NOT NULL;
-
--- (name, location) identifies only beneficiaries without a reference number
--- (original-form records). Once a household has a reference number, two
--- different elders with the same name in the same village can coexist.
--- Replaces the original unconditional idx_beneficiaries_identity.
-DROP INDEX IF EXISTS idx_beneficiaries_identity;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_beneficiaries_identity_unreferenced
-  ON beneficiaries (lower(name), lower(location)) WHERE reference_number IS NULL;
-
--- Media & Evidence uploads. The file itself lives on disk under UPLOAD_DIR
--- as storage_name; visits reference uploads by id from form_data.
-CREATE TABLE IF NOT EXISTS uploads (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  uploaded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  kind TEXT NOT NULL,
-  original_name TEXT NOT NULL,
-  mime_type TEXT NOT NULL,
-  size_bytes BIGINT NOT NULL,
-  storage_name TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- Last number handed out per ward code for generated reference numbers
--- (BHECO-<code>-<number>). Reserving through this table keeps two officers
--- generating at the same moment from ever getting the same number.
-CREATE TABLE IF NOT EXISTS reference_sequences (
-  code TEXT PRIMARY KEY,
-  last_number INTEGER NOT NULL
-);

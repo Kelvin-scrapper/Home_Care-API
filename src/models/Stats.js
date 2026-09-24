@@ -26,7 +26,8 @@ async function getDashboard({ isOwnOnly, userId }) {
     ),
     pool.query(
       `SELECT COUNT(*)::int AS count FROM visits
-       WHERE ${scopeClause} AND urgency_level = 'Follow-up Needed'`,
+       WHERE ${scopeClause}
+         AND (urgency_level = 'Follow-up Needed' OR form_data->>'followUpRequired' = 'Yes')`,
       scopeParams
     ),
     pool.query(

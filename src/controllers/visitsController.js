@@ -1,6 +1,57 @@
 const Visit = require('../models/Visit');
 const Beneficiary = require('../models/Beneficiary');
+const Upload = require('../models/Upload');
+const { toXlsx, toCsv } = require('../utils/visitExport');
 const { visitFormSchema } = require('../schemas/visit');
+const {
+  FORM_VERSION,
+  validateVisitForm,
+  fileFields,
+  normalizeReferenceNumber,
+} = require('../schemas/visitFormDefinition');
+
+// Validates a v2 submission and swaps each file reference for the stored
+// upload's metadata. Returns { formData } or { status, body } on failure.
+// `previousFormData` lets an edit keep files someone else attached.
+async function prepareV2Form(body, user, previousFormData) {
+  const { data, errors } = validateVisitForm(body);
+  if (Object.keys(errors).length > 0) {
+    return { status: 400, body: { error: 'Please complete all required fields', fieldErrors: errors } };
+  }
+  data.referenceNumber = normalizeReferenceNumber(data.referenceNumber);
+
+  const fields = fileFields().filter((f) => data[f.name]);
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const invalid = fields.find((f) => !uuidPattern.test(data[f.name].id));
+  if (invalid) {
+    return { status: 400, body: { error: 'Invalid file', fieldErrors: { [invalid.name]: 'Invalid file' } } };
+  }
+
+  const rows = await Upload.findManyByIds(fields.map((f) => data[f.name].id));
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const previousIds = new Set(
+    Object.values(previousFormData || {})
+      .filter((v) => v && typeof v === 'object' && typeof v.id === 'string')
+      .map((v) => v.id)
+  );
+
+  for (const field of fields) {
+    const row = byId.get(data[field.name].id);
+    const usable =
+      row &&
+      row.kind === field.fileKind &&
+      (row.uploaded_by === user.id || previousIds.has(row.id));
+    if (!usable) {
+      return {
+        status: 400,
+        body: { error: 'An attached file could not be found', fieldErrors: { [field.name]: 'File not found — please upload it again' } },
+      };
+    }
+    data[field.name] = Upload.toUpload(row);
+  }
+
+  return { formData: data };
+}
 
 // List visits. Volunteers only see visits they logged themselves;
 // coordinators/directors/admins see everything. Paginated via
@@ -37,6 +88,41 @@ async function detail(req, res) {
 // Create a visit. Only field staff (volunteers and coordinators) log visits —
 // enforced by requireRole on the route.
 async function create(req, res) {
+  if (req.body?.formVersion === FORM_VERSION) {
+    const prepared = await prepareV2Form(req.body, req.user, null);
+    if (!prepared.formData) {
+      return res.status(prepared.status).json(prepared.body);
+    }
+    const { formData } = prepared;
+
+    // A new reference number for a name + village that already has one is
+    // probably the same person registered twice — ask before creating them.
+    if (req.body.confirmNewBeneficiary !== true && !(await Beneficiary.findIdByReference(formData.referenceNumber))) {
+      const possibleDuplicates = await Beneficiary.findPossibleDuplicates(formData.beneficiaryName, formData.villageArea);
+      if (possibleDuplicates.length > 0) {
+        return res.status(409).json({
+          error: 'A beneficiary with this name and village already has a reference number',
+          possibleDuplicates,
+        });
+      }
+    }
+
+    const beneficiaryId = await Beneficiary.findOrCreateByReference({
+      referenceNumber: formData.referenceNumber,
+      name: formData.beneficiaryName,
+      location: formData.villageArea,
+      age: formData.age,
+      weight: formData.weight,
+    });
+    const visit = await Visit.createV2({
+      createdBy: req.user.id,
+      beneficiaryId,
+      formVersion: FORM_VERSION,
+      formData,
+    });
+    return res.status(201).json(visit);
+  }
+
   const parsed = visitFormSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({
@@ -67,15 +153,7 @@ async function update(req, res) {
     return res.status(400).json({ error: 'Invalid visit id' });
   }
 
-  const parsed = visitFormSchema.partial().safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({
-      error: 'Invalid visit data',
-      details: parsed.error.flatten(),
-    });
-  }
-
-  const existing = await Visit.findCreatorById(visitId);
+  const existing = await Visit.findFormById(visitId);
   if (!existing) {
     return res.status(404).json({ error: 'Visit not found' });
   }
@@ -83,6 +161,27 @@ async function update(req, res) {
   const user = req.user;
   if (user.role === 'Volunteer/CHW' && existing.created_by !== user.id) {
     return res.status(403).json({ error: 'You can only edit visits you logged yourself' });
+  }
+
+  // A v2 edit sends the whole form and replaces it.
+  if (req.body?.formVersion === FORM_VERSION) {
+    const prepared = await prepareV2Form(req.body, user, existing.form_data);
+    if (!prepared.formData) {
+      return res.status(prepared.status).json(prepared.body);
+    }
+    const visit = await Visit.updateV2(visitId, { formVersion: FORM_VERSION, formData: prepared.formData });
+    return res.json(visit);
+  }
+  if (existing.form_version >= FORM_VERSION) {
+    return res.status(400).json({ error: 'This visit uses the new form; send the full form with formVersion 2' });
+  }
+
+  const parsed = visitFormSchema.partial().safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: 'Invalid visit data',
+      details: parsed.error.flatten(),
+    });
   }
 
   const updated = await Visit.update(visitId, parsed.data);
@@ -93,4 +192,33 @@ async function update(req, res) {
   res.json(updated);
 }
 
-module.exports = { list, detail, create, update };
+// Download visits as a spreadsheet (?format=xlsx|csv, optional ?from=&to=
+// visit-date range). Same visibility rule as list().
+async function exportVisits(req, res) {
+  const format = req.query.format === 'csv' ? 'csv' : 'xlsx';
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  const { from, to } = req.query;
+  for (const value of [from, to]) {
+    if (value !== undefined && (typeof value !== 'string' || !datePattern.test(value))) {
+      return res.status(400).json({ error: 'from and to must be dates in YYYY-MM-DD format' });
+    }
+  }
+
+  const visits = await Visit.listForExport({
+    isOwnOnly: req.user.role === 'Volunteer/CHW',
+    userId: req.user.id,
+    from,
+    to,
+  });
+
+  const stamp = new Date().toISOString().slice(0, 10);
+  if (format === 'csv') {
+    res.attachment(`bheco-visits-${stamp}.csv`);
+    res.type('text/csv; charset=utf-8');
+    return res.send(toCsv(visits));
+  }
+  res.attachment(`bheco-visits-${stamp}.xlsx`);
+  res.send(Buffer.from(await toXlsx(visits)));
+}
+
+module.exports = { list, detail, create, update, exportVisits };

@@ -14,6 +14,8 @@ const usersRoutes = require('./routes/users');
 const beneficiariesRoutes = require('./routes/beneficiaries');
 const visitsRoutes = require('./routes/visits');
 const statsRoutes = require('./routes/stats');
+const uploadsRoutes = require('./routes/uploads');
+const { startUploadCleanup } = require('./jobs/cleanupUploads');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -30,14 +32,18 @@ if (Number.isInteger(trustProxyHops) && trustProxyHops > 0) {
 const allowedOrigins = process.env.FRONTEND_ORIGIN
   ? process.env.FRONTEND_ORIGIN.split(',').map((origin) => origin.trim())
   : true;
-app.use(cors({ origin: allowedOrigins }));
-app.use(express.json());
+// Content-Disposition carries the filename of spreadsheet exports; browsers
+// hide it from cross-origin JavaScript unless it's exposed.
+app.use(cors({ origin: allowedOrigins, exposedHeaders: ['Content-Disposition'] }));
+// The v2 visit form has many long free-text answers; 100kb (the default) is too tight.
+app.use(express.json({ limit: '1mb' }));
 
 app.use('/auth', authRoutes);
 app.use('/users', usersRoutes);
 app.use('/beneficiaries', beneficiariesRoutes);
 app.use('/visits', visitsRoutes);
 app.use('/stats', statsRoutes);
+app.use('/uploads', uploadsRoutes);
 
 app.get('/health', async (req, res) => {
   try {
@@ -60,6 +66,12 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`Home Care API listening on port ${PORT}`);
-});
+// Tests import the app without starting the server or the cleanup timer.
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Home Care API listening on port ${PORT}`);
+  });
+  startUploadCleanup();
+}
+
+module.exports = app;

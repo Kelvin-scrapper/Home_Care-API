@@ -73,6 +73,8 @@ function toVisit(row) {
     createdBy: row.created_by,
     beneficiaryId: row.beneficiary_id,
     createdAt: row.created_at,
+    formVersion: row.form_version,
+    formData: row.form_data,
   };
   for (const [key, column] of Object.entries(FIELD_MAP)) {
     visit[key] = row[column];
@@ -131,13 +133,6 @@ async function create({ createdBy, beneficiaryId, data }) {
   return toVisit(result.rows[0]);
 }
 
-// Just enough to check edit ownership without fetching (and mapping) the
-// full row — used by the PATCH ownership check before the real update.
-async function findCreatorById(id) {
-  const { rows } = await pool.query('SELECT created_by FROM visits WHERE id = $1', [id]);
-  return rows[0] || null;
-}
-
 // A single visit, e.g. to pre-fill an edit form. Volunteers only see visits
 // they logged themselves — scoped the same way as list().
 async function findById(id, { isOwnOnly, userId }) {
@@ -167,4 +162,85 @@ async function update(id, partialData) {
   return toVisit(result.rows[0]);
 }
 
-module.exports = { list, listByBeneficiary, create, update, findCreatorById, findById, toVisit };
+// The flat columns every list/stat/directory query reads, derived from a v2
+// form so those keep working without knowing about form_data.
+function summaryColumns(formData) {
+  return {
+    beneficiary_name: formData.beneficiaryName,
+    age: formData.age,
+    weight: formData.weight,
+    location: formData.villageArea,
+    volunteer_name: formData.fieldOfficerName,
+    visit_date: formData.visitDate,
+    registered_sha: formData.registeredSha,
+    receiving_stipend: formData.receivingStipend,
+    needs_identified: formData.importantNeeds,
+    actions_recommendations: formData.immediateFollowUp,
+    urgency_level: formData.urgentConcern === 'Yes' ? 'Urgent' : 'Routine',
+  };
+}
+
+async function createV2({ createdBy, beneficiaryId, formVersion, formData }) {
+  const row = summaryColumns(formData);
+  const columns = Object.keys(row);
+  const values = Object.values(row);
+  const placeholders = values.map((_, i) => `$${i + 5}`);
+
+  const result = await pool.query(
+    `INSERT INTO visits (created_by, beneficiary_id, form_version, form_data, ${columns.join(', ')})
+     VALUES ($1, $2, $3, $4, ${placeholders.join(', ')})
+     RETURNING *`,
+    [createdBy, beneficiaryId, formVersion, formData, ...values]
+  );
+  return toVisit(result.rows[0]);
+}
+
+// Replaces the whole v2 form. Like update(), does not re-link the visit to a
+// different beneficiary — identity is fixed at creation.
+async function updateV2(id, { formVersion, formData }) {
+  const row = summaryColumns(formData);
+  const columns = Object.keys(row);
+  const setClauses = columns.map((column, i) => `${column} = $${i + 4}`);
+
+  const result = await pool.query(
+    `UPDATE visits SET form_version = $2, form_data = $3, ${setClauses.join(', ')}
+     WHERE id = $1 RETURNING *`,
+    [id, formVersion, formData, ...Object.values(row)]
+  );
+  return toVisit(result.rows[0]);
+}
+
+async function findFormById(id) {
+  const { rows } = await pool.query(
+    'SELECT created_by, form_version, form_data FROM visits WHERE id = $1',
+    [id]
+  );
+  return rows[0] || null;
+}
+
+// Every visit in scope for a spreadsheet export, oldest first. from/to are
+// optional YYYY-MM-DD bounds on the visit date (inclusive).
+async function listForExport({ isOwnOnly, userId, from, to }) {
+  const conditions = [];
+  const params = [];
+  if (isOwnOnly) {
+    params.push(userId);
+    conditions.push(`created_by = $${params.length}`);
+  }
+  if (from) {
+    params.push(from);
+    conditions.push(`visit_date >= $${params.length}`);
+  }
+  if (to) {
+    params.push(to);
+    conditions.push(`visit_date <= $${params.length}`);
+  }
+  const { rows } = await pool.query(
+    `SELECT * FROM visits ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
+     ORDER BY visit_date ASC, id ASC`,
+    params
+  );
+  return rows.map(toVisit);
+}
+
+module.exports = { listForExport, list, listByBeneficiary, create, update, createV2, updateV2, findFormById, findById, toVisit };
