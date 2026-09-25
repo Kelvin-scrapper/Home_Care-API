@@ -1,7 +1,8 @@
 const Visit = require('../models/Visit');
 const Beneficiary = require('../models/Beneficiary');
 const Upload = require('../models/Upload');
-const { toXlsx, toCsv } = require('../utils/visitExport');
+const { toXlsx, toCsv, toZip } = require('../utils/visitExport');
+const { RETENTION_DAYS } = require('../jobs/purgeDeletedVisits');
 const { visitFormSchema } = require('../schemas/visit');
 const {
   FORM_VERSION,
@@ -195,7 +196,7 @@ async function update(req, res) {
 // Download visits as a spreadsheet (?format=xlsx|csv, optional ?from=&to=
 // visit-date range). Same visibility rule as list().
 async function exportVisits(req, res) {
-  const format = req.query.format === 'csv' ? 'csv' : 'xlsx';
+  const format = ['csv', 'zip'].includes(req.query.format) ? req.query.format : 'xlsx';
   const datePattern = /^\d{4}-\d{2}-\d{2}$/;
   const { from, to } = req.query;
   for (const value of [from, to]) {
@@ -212,6 +213,11 @@ async function exportVisits(req, res) {
   });
 
   const stamp = new Date().toISOString().slice(0, 10);
+  if (format === 'zip') {
+    res.attachment(`bheco-visits-${stamp}.zip`);
+    res.type('application/zip');
+    return toZip(visits, res);
+  }
   if (format === 'csv') {
     res.attachment(`bheco-visits-${stamp}.csv`);
     res.type('text/csv; charset=utf-8');
@@ -221,4 +227,41 @@ async function exportVisits(req, res) {
   res.send(Buffer.from(await toXlsx(visits)));
 }
 
-module.exports = { list, detail, create, update, exportVisits };
+function visitIdFrom(req) {
+  const id = parseInt(req.params.id, 10);
+  return Number.isInteger(id) ? id : null;
+}
+
+// Admin only. Hides the visit everywhere; restorable for RETENTION_DAYS.
+async function remove(req, res) {
+  const visitId = visitIdFrom(req);
+  if (visitId === null) {
+    return res.status(400).json({ error: 'Invalid visit id' });
+  }
+  if (!(await Visit.softDelete(visitId, req.user.id))) {
+    return res.status(404).json({ error: 'Visit not found' });
+  }
+  console.info(`[visits] user ${req.user.id} deleted visit ${visitId}`);
+  res.status(204).send();
+}
+
+// Admin only. Deleted visits that can still be restored.
+async function listDeleted(req, res) {
+  res.json({ retentionDays: RETENTION_DAYS, visits: await Visit.listDeleted(RETENTION_DAYS) });
+}
+
+// Admin only.
+async function restore(req, res) {
+  const visitId = visitIdFrom(req);
+  if (visitId === null) {
+    return res.status(400).json({ error: 'Invalid visit id' });
+  }
+  const visit = await Visit.restore(visitId);
+  if (!visit) {
+    return res.status(404).json({ error: 'No deleted visit with that id' });
+  }
+  console.info(`[visits] user ${req.user.id} restored visit ${visitId}`);
+  res.json(visit);
+}
+
+module.exports = { list, detail, create, update, exportVisits, remove, listDeleted, restore };

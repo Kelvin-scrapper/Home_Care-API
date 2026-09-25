@@ -43,7 +43,8 @@ async function isVisibleToVolunteer(uploadId, userId) {
     `SELECT 1 FROM uploads WHERE id = $1 AND uploaded_by = $2
      UNION ALL
      SELECT 1 FROM visits v, jsonb_each(v.form_data) AS f(key, value)
-     WHERE v.created_by = $2 AND jsonb_typeof(f.value) = 'object' AND f.value->>'id' = $1::text
+     WHERE v.created_by = $2 AND v.deleted_at IS NULL
+       AND jsonb_typeof(f.value) = 'object' AND f.value->>'id' = $1::text
      LIMIT 1`,
     [uploadId, userId]
   );
@@ -53,6 +54,8 @@ async function isVisibleToVolunteer(uploadId, userId) {
 // Uploads older than the cutoff that no visit references — files from forms
 // that were never submitted, or replaced during an edit. Deletes the rows
 // and returns their storage names so the caller can remove the files.
+// Deleted-but-recoverable visits still count as referencing their files, so
+// a restore gets them back; once the visit is purged its files go here.
 async function deleteUnattachedOlderThan(days) {
   const { rows } = await pool.query(
     `DELETE FROM uploads u

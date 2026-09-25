@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const ExcelJS = require('exceljs');
+const JSZip = require('jszip');
 const { startTestServer } = require('./helpers/testServer');
 
 let t; // test server
@@ -15,7 +16,7 @@ function baseForm(overrides = {}) {
   return {
     formVersion: 2,
     fieldOfficerName: 'Vera', fieldOfficerPhone: '0712345678', visitDate: '2026-09-20', visitTypes: ['Follow-up Visit'],
-    referenceNumber: state.maryRef, villageArea: 'Kiamaina', ward: 'Nakuru', constituency: 'Bahati',
+    referenceNumber: state.maryRef, villageArea: 'Kiamaina', ward: 'Nakuru East', constituency: 'Nakuru Town East',
     beneficiaryName: 'Mary Wanjiru', age: '82', weight: '50', registeredSha: 'Yes', receivingStipend: 'No', gender: 'Female',
     nationalId: '12345678', physicalAddress: 'Near church', livingArrangement: ['Lives alone'],
     nokName: 'John', nokRelationship: 'Son', nokPhone: '0711000000',
@@ -148,6 +149,46 @@ describe('users (Admin only)', () => {
     assert.equal((await t.request('PATCH', '/users/abc', tokens.admin, { name: 'x' })).status, 400);
     assert.equal((await t.request('PATCH', `/users/${state.newUserId}`, tokens.admin, {})).status, 400);
     assert.equal((await t.request('PATCH', '/users/1', tokens.coord, { name: 'x' })).status, 403);
+  });
+
+  it('deactivates an account: its session ends and it can no longer sign in', async () => {
+    const id = state.newUserId;
+    const sessionToken = await t.login('new@bheco.org', 'longenough1');
+    assert.equal((await t.request('GET', '/auth/me', sessionToken)).status, 200);
+
+    const res = await t.request('PATCH', `/users/${id}`, tokens.admin, { active: false });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.active, false);
+    assert.ok(res.body.deactivatedAt);
+
+    assert.equal((await t.request('GET', '/auth/me', sessionToken)).status, 401, 'existing session ends');
+    const login = await t.request('POST', '/auth/login', null, { email: 'new@bheco.org', password: 'longenough1' });
+    assert.equal(login.status, 403);
+    assert.match(login.body.error, /deactivated/);
+    const wrong = await t.request('POST', '/auth/login', null, { email: 'new@bheco.org', password: 'wrong-password' });
+    assert.equal(wrong.status, 401, 'a wrong password still gets the generic answer');
+
+    const listed = (await t.request('GET', '/users', tokens.admin)).body.find((u) => u.id === id);
+    assert.equal(listed.active, false, 'still listed, marked inactive');
+  });
+
+  it('reactivates, and refuses self-deactivation or losing the last active Admin', async () => {
+    const id = state.newUserId;
+    assert.equal((await t.request('PATCH', `/users/${id}`, tokens.admin, { active: 'no' })).status, 400);
+    assert.equal((await t.request('PATCH', '/users/5', tokens.admin, { active: false })).status, 400, 'not yourself');
+    assert.equal((await t.request('PATCH', `/users/${id}`, tokens.coord, { active: true })).status, 403);
+
+    // A deactivated Admin doesn't count towards "at least one active Admin".
+    assert.equal((await t.request('PATCH', `/users/${id}`, tokens.admin, { role: 'Admin' })).status, 200);
+    const lastAdmin = await t.request('PATCH', '/users/5', tokens.admin, { role: 'Volunteer/CHW' });
+    assert.equal(lastAdmin.status, 400);
+    assert.match(lastAdmin.body.error, /active Admin/);
+
+    const res = await t.request('PATCH', `/users/${id}`, tokens.admin, { active: true, role: 'Coordinator/Field officer' });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.active, true);
+    assert.equal(res.body.deactivatedAt, null);
+    assert.ok(await t.login('new@bheco.org', 'longenough1'), 'can sign in again');
   });
 });
 
@@ -350,7 +391,7 @@ describe('beneficiaries', () => {
     assert.equal(res.status, 200);
     assert.equal(res.body.beneficiary.name, 'Mary Wanjiru');
     assert.equal(res.body.prefill.values.nokName, 'John');
-    assert.equal(res.body.prefill.values.constituency, 'Bahati');
+    assert.equal(res.body.prefill.values.constituency, 'Nakuru Town East');
     assert.ok(!('weight' in res.body.prefill.values), 'weight is re-measured, not copied');
     assert.ok(!('storyQuote' in res.body.prefill.values), 'only identity/contact answers are copied');
   });
@@ -426,6 +467,142 @@ describe('export', () => {
     assert.equal(csv.trim().split('\r\n').length, 1, 'header only');
     assert.equal((await t.request('GET', '/visits/export?from=yesterday', tokens.dir)).status, 400);
     assert.equal((await t.request('GET', '/visits/export')).status, 401);
+  });
+
+  it('downloads a ZIP with the spreadsheets and every attached file, byte for byte', async () => {
+    const res = await t.request('GET', '/visits/export?format=zip', tokens.dir);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'application/zip');
+    assert.match(res.headers.get('content-disposition'), /bheco-visits-.*\.zip/);
+    const zip = await JSZip.loadAsync(res.buffer);
+    assert.ok(zip.file('visits.xlsx') && zip.file('visits.csv'));
+    assert.equal(zip.file('MISSING_FILES.txt'), null);
+
+    const visit = (await t.request('GET', `/visits/${state.maryVisit.id}`, tokens.dir)).body;
+    const folder = `files/${visit.id}_${visit.formData.referenceNumber}_${visit.formData.visitDate}/`;
+    const attached = ['photo', 'videoInterview', 'supportingDocument'].filter((f) => visit.formData[f]);
+    assert.ok(attached.length >= 1);
+    for (const field of attached) {
+      const file = visit.formData[field];
+      const entry = Object.values(zip.files).find((e) => e.name.startsWith(folder) && e.name.endsWith(` - ${file.name}`));
+      assert.ok(entry, `${field} (${file.name}) is in ${folder}`);
+      const original = (await t.request('GET', `/uploads/${file.id}`, tokens.dir)).buffer;
+      assert.ok((await entry.async('nodebuffer')).equals(original), `${file.name} is byte-identical`);
+    }
+
+    // The spreadsheet inside points at the file's place in the ZIP.
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(await zip.file('visits.xlsx').async('nodebuffer'));
+    const sheet = workbook.getWorksheet('Visits');
+    const headers = sheet.getRow(1).values.slice(1);
+    const row = sheet.getRows(2, sheet.rowCount - 1).find((r) => r.getCell(headers.indexOf('Visit ID') + 1).value === visit.id);
+    assert.equal(row.getCell(headers.indexOf('Upload Beneficiary Photograph') + 1).value, `${folder}Upload Beneficiary Photograph - mary.jpg`);
+  });
+
+  it('scopes and filters ZIPs like the spreadsheets, and lists files missing on disk', async () => {
+    const vol2Zip = await JSZip.loadAsync((await t.request('GET', '/visits/export?format=zip', tokens.vol2)).buffer);
+    assert.equal(Object.keys(vol2Zip.files).filter((n) => n.startsWith('files/')).length, 0, 'no one else’s files');
+
+    const dayZip = await JSZip.loadAsync((await t.request('GET', '/visits/export?format=zip&from=2026-09-21&to=2026-09-21', tokens.dir)).buffer);
+    assert.ok(!Object.keys(dayZip.files).some((n) => n.startsWith(`files/${state.maryVisit.id}_`)), 'outside the date range');
+
+    const { rows } = await t.db.query('SELECT storage_name FROM uploads WHERE id = $1', [state.img.id]);
+    const diskPath = path.join(t.uploadDir, rows[0].storage_name);
+    fs.renameSync(diskPath, `${diskPath}.moved`);
+    try {
+      const res = await t.request('GET', '/visits/export?format=zip', tokens.dir);
+      assert.equal(res.status, 200);
+      const zip = await JSZip.loadAsync(res.buffer);
+      assert.match(await zip.file('MISSING_FILES.txt').async('string'), /mary\.jpg/);
+      assert.ok(zip.file('visits.xlsx'), 'the rest of the export still arrives');
+    } finally {
+      fs.renameSync(`${diskPath}.moved`, diskPath);
+    }
+  });
+});
+
+describe('deleting visits (Admin, recoverable)', () => {
+  const ytd = async () => (await t.request('GET', '/stats/dashboard', tokens.dir)).body.totalVisitsYtd;
+  const listIds = async (token) => (await t.request('GET', '/visits?limit=200', token)).body.visits.map((v) => v.id);
+
+  before(async () => {
+    const photo = await t.upload(tokens.vol, 'image', 'delete-me.jpg', 'image/jpeg', Buffer.alloc(3, 7));
+    const res = await t.request('POST', '/visits', tokens.vol, baseForm({ photo: { id: photo.body.id }, visitDate: '2026-09-22' }));
+    assert.equal(res.status, 201);
+    state.binVisit = res.body;
+    state.binPhotoId = photo.body.id;
+  });
+
+  it('only Admins can delete', async () => {
+    for (const role of ['vol', 'coord', 'dir']) {
+      assert.equal((await t.request('DELETE', `/visits/${state.binVisit.id}`, tokens[role])).status, 403, role);
+    }
+    assert.equal((await t.request('DELETE', '/visits/abc', tokens.admin)).status, 400);
+    assert.equal((await t.request('DELETE', '/visits/99999', tokens.admin)).status, 404);
+  });
+
+  it('hides a deleted visit everywhere', async () => {
+    const id = state.binVisit.id;
+    const before = await ytd();
+    assert.equal((await t.request('DELETE', `/visits/${id}`, tokens.admin)).status, 204);
+    assert.equal((await t.request('DELETE', `/visits/${id}`, tokens.admin)).status, 404, 'already deleted');
+
+    assert.equal((await t.request('GET', `/visits/${id}`, tokens.coord)).status, 404);
+    assert.equal((await t.request('GET', `/visits/${id}`, tokens.vol)).status, 404, 'even for the officer who logged it');
+    assert.ok(!(await listIds(tokens.dir)).includes(id));
+    const history = (await t.request('GET', '/beneficiaries/1', tokens.dir)).body.visits.map((v) => v.id);
+    assert.ok(!history.includes(id));
+    assert.equal(await ytd(), before - 1, 'left out of the dashboard figures');
+    const csv = (await t.request('GET', '/visits/export?format=csv', tokens.dir)).buffer.toString('utf8');
+    assert.ok(!csv.includes(`\r\n"${id}",`), 'left out of exports');
+    const edit = await t.request('PATCH', `/visits/${id}`, tokens.vol, baseForm({ photo: null }));
+    assert.equal(edit.status, 404, "can't be edited");
+  });
+
+  it('lists deleted visits for Admins with who deleted them and when they go for good', async () => {
+    const res = await t.request('GET', '/visits/deleted', tokens.admin);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.retentionDays, 30);
+    const entry = res.body.visits.find((v) => v.id === state.binVisit.id);
+    assert.equal(entry.deletedByName, 'Adam Admin');
+    assert.equal(entry.beneficiaryName, 'Mary Wanjiru');
+    const days = (new Date(entry.purgeAt) - new Date(entry.deletedAt)) / 86_400_000;
+    assert.ok(Math.abs(days - 30) < 0.01, `purged 30 days after deletion (${days})`);
+    assert.equal((await t.request('GET', '/visits/deleted', tokens.dir)).status, 403);
+  });
+
+  it('restores a deleted visit', async () => {
+    const id = state.binVisit.id;
+    assert.equal((await t.request('POST', `/visits/${id}/restore`, tokens.coord)).status, 403);
+    const res = await t.request('POST', `/visits/${id}/restore`, tokens.admin);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.id, id);
+    assert.equal((await t.request('POST', `/visits/${id}/restore`, tokens.admin)).status, 404, 'not in the bin any more');
+    assert.equal((await t.request('GET', `/visits/${id}`, tokens.vol)).status, 200);
+    assert.ok((await listIds(tokens.dir)).includes(id));
+    assert.ok(!(await t.request('GET', '/visits/deleted', tokens.admin)).body.visits.some((v) => v.id === id));
+  });
+
+  it('keeps the files while recoverable, then removes visit and files after 30 days', async () => {
+    const { purgeDeletedVisits } = require('../src/jobs/purgeDeletedVisits');
+    const { cleanupUploads } = require('../src/jobs/cleanupUploads');
+    const id = state.binVisit.id;
+    const { rows } = await t.db.query('SELECT storage_name FROM uploads WHERE id = $1', [state.binPhotoId]);
+    const photoPath = path.join(t.uploadDir, rows[0].storage_name);
+
+    assert.equal((await t.request('DELETE', `/visits/${id}`, tokens.admin)).status, 204);
+    await t.db.query(`UPDATE uploads SET created_at = now() - interval '8 days' WHERE id = $1`, [state.binPhotoId]);
+    await t.db.query(`UPDATE visits SET deleted_at = now() - interval '29 days' WHERE id = $1`, [id]);
+    assert.deepEqual(await purgeDeletedVisits(30), [], 'not yet 30 days');
+    await cleanupUploads(7);
+    assert.ok(fs.existsSync(photoPath), 'file kept while the visit can still be restored');
+
+    await t.db.query(`UPDATE visits SET deleted_at = now() - interval '31 days' WHERE id = $1`, [id]);
+    assert.deepEqual(await purgeDeletedVisits(30), [id]);
+    assert.equal((await t.db.query('SELECT 1 FROM visits WHERE id = $1', [id])).rows.length, 0, 'row gone');
+    assert.equal((await t.request('POST', `/visits/${id}/restore`, tokens.admin)).status, 404);
+    await cleanupUploads(7);
+    assert.ok(!fs.existsSync(photoPath), 'file removed once the visit is gone');
   });
 });
 

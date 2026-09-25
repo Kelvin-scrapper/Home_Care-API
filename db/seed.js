@@ -96,9 +96,10 @@ async function main() {
   }
   validateUsers(users);
 
+  // The SEED_ADMIN_* override also reactivates, so it stays a way back in.
   const onConflict = useFixedUsers
     ? 'DO NOTHING'
-    : 'DO UPDATE SET name = EXCLUDED.name, password_hash = EXCLUDED.password_hash, role = EXCLUDED.role';
+    : 'DO UPDATE SET name = EXCLUDED.name, password_hash = EXCLUDED.password_hash, role = EXCLUDED.role, deactivated_at = NULL';
 
   for (const user of users) {
     await pool.query(

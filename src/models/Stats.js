@@ -2,9 +2,10 @@ const pool = require('../db');
 
 // Single aggregate query set backing every role's dashboard. Each of the
 // four dashboards (Volunteer/Coordinator/Director/Admin) reads only the
-// fields it needs from this response.
+// fields it needs from this response. Deleted visits and deactivated users
+// are left out of every figure.
 async function getDashboard({ isOwnOnly, userId }) {
-  const scopeClause = isOwnOnly ? 'created_by = $1' : 'TRUE';
+  const scopeClause = isOwnOnly ? 'deleted_at IS NULL AND created_by = $1' : 'deleted_at IS NULL';
   const scopeParams = isOwnOnly ? [userId] : [];
 
   const [
@@ -40,29 +41,33 @@ async function getDashboard({ isOwnOnly, userId }) {
     ),
     pool.query(
       `SELECT COUNT(*)::int AS count FROM users
-       WHERE role IN ('Volunteer/CHW', 'Coordinator/Field officer')`
+       WHERE role IN ('Volunteer/CHW', 'Coordinator/Field officer') AND deactivated_at IS NULL`
     ),
     pool.query(
       `SELECT COUNT(*)::int AS count FROM visits
-       WHERE created_at >= date_trunc('day', now())`
+       WHERE deleted_at IS NULL AND created_at >= date_trunc('day', now())`
     ),
     pool.query(
       `SELECT COUNT(*)::int AS count FROM visits
-       WHERE urgency_level ILIKE 'Urgent%'`
+       WHERE deleted_at IS NULL AND urgency_level ILIKE 'Urgent%'`
     ),
-    pool.query(`SELECT COUNT(*)::int AS count FROM beneficiaries`),
+    pool.query(
+      `SELECT COUNT(*)::int AS count FROM beneficiaries b
+       WHERE EXISTS (SELECT 1 FROM visits v WHERE v.beneficiary_id = b.id AND v.deleted_at IS NULL)`
+    ),
     pool.query(
       `SELECT COUNT(*)::int AS count FROM visits
-       WHERE created_at >= date_trunc('year', now())`
+       WHERE deleted_at IS NULL AND created_at >= date_trunc('year', now())`
     ),
     pool.query(
       `SELECT volunteer_name AS name, COUNT(*)::int AS count
        FROM visits
+       WHERE deleted_at IS NULL
        GROUP BY volunteer_name
        ORDER BY count DESC
        LIMIT 5`
     ),
-    pool.query(`SELECT COUNT(*)::int AS count FROM users`),
+    pool.query(`SELECT COUNT(*)::int AS count FROM users WHERE deactivated_at IS NULL`),
   ]);
 
   return {

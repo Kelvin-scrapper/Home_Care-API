@@ -45,19 +45,29 @@ async function create(req, res) {
   res.status(201).json(user);
 }
 
-// Edit an account. Any of name, email, role and password may be sent; only
-// those are changed. Role changes apply immediately: the role is read fresh
-// from the database on every authenticated request, not baked into the token.
-// (Sessions that already exist stay valid until their token expires, even
-// after a password reset.)
+// Edit an account. Any of name, email, role, password and active may be sent;
+// only those are changed. Role changes and deactivation apply immediately:
+// the user is re-read from the database on every authenticated request, so a
+// deactivated person's session ends on their next request. (A password reset
+// alone leaves existing sessions valid until their token expires.)
 async function update(req, res) {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id)) {
     return res.status(400).json({ error: 'Invalid user id' });
   }
 
-  const { name, email, password, role } = req.body ?? {};
+  const { name, email, password, role, active } = req.body ?? {};
   const changes = {};
+
+  if (active !== undefined) {
+    if (typeof active !== 'boolean') {
+      return res.status(400).json({ error: 'active must be true or false' });
+    }
+    if (active === false && id === req.user.id) {
+      return res.status(400).json({ error: "You can't deactivate your own account" });
+    }
+    changes.active = active;
+  }
 
   if (name !== undefined) {
     if (typeof name !== 'string' || !name.trim()) {
@@ -103,11 +113,14 @@ async function update(req, res) {
     }
   }
 
-  // Never leave the system without an Admin (including an Admin demoting themselves).
-  if (changes.role && target.role === 'Admin' && changes.role !== 'Admin') {
-    if ((await User.countByRole('Admin')) <= 1) {
-      return res.status(400).json({ error: 'At least one Admin account must remain' });
-    }
+  // Never leave the system without an active Admin — whether by demoting or
+  // deactivating the last one (including an Admin demoting themselves).
+  const removesActiveAdmin =
+    target.role === 'Admin' &&
+    target.active &&
+    ((changes.role && changes.role !== 'Admin') || changes.active === false);
+  if (removesActiveAdmin && (await User.countActiveByRole('Admin')) <= 1) {
+    return res.status(400).json({ error: 'At least one active Admin account must remain' });
   }
 
   let updated;
@@ -121,7 +134,8 @@ async function update(req, res) {
     throw err;
   }
 
-  console.info(`[users] user ${req.user.id} updated user ${id}: ${Object.keys(changes).join(', ')}`);
+  const what = Object.keys(changes).map((k) => (k === 'active' ? (changes.active ? 'reactivated' : 'deactivated') : k));
+  console.info(`[users] user ${req.user.id} updated user ${id}: ${what.join(', ')}`);
   res.json(updated);
 }
 

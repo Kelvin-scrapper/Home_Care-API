@@ -16,6 +16,7 @@ const visitsRoutes = require('./routes/visits');
 const statsRoutes = require('./routes/stats');
 const uploadsRoutes = require('./routes/uploads');
 const { startUploadCleanup } = require('./jobs/cleanupUploads');
+const { startDeletedVisitPurge } = require('./jobs/purgeDeletedVisits');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -71,6 +72,7 @@ if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`Home Care API listening on port ${PORT}`);
   });
+  startDeletedVisitPurge();
   startUploadCleanup();
 }
 

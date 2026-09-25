@@ -91,7 +91,7 @@ async function list({ isOwnOnly, userId }) {
             COUNT(v.id)::int AS "visitCount",
             MAX(v.created_at) AS "lastVisitAt"
      FROM beneficiaries b
-     JOIN visits v ON v.beneficiary_id = b.id
+     JOIN visits v ON v.beneficiary_id = b.id AND v.deleted_at IS NULL
      ${isOwnOnly ? 'WHERE v.created_by = $1' : ''}
      GROUP BY b.id
      ORDER BY "lastVisitAt" DESC`,
@@ -154,7 +154,7 @@ async function findByReference(referenceNumber) {
     `SELECT b.id, b.name, b.location, b.age, b.reference_number AS "referenceNumber",
             COUNT(v.id)::int AS "visitCount"
      FROM beneficiaries b
-     LEFT JOIN visits v ON v.beneficiary_id = b.id
+     LEFT JOIN visits v ON v.beneficiary_id = b.id AND v.deleted_at IS NULL
      WHERE b.reference_number = $1
      GROUP BY b.id`,
     [referenceNumber]
@@ -169,7 +169,7 @@ async function findPossibleDuplicates(name, location) {
     `SELECT b.id, b.name, b.location, b.reference_number AS "referenceNumber",
             COUNT(v.id)::int AS "visitCount"
      FROM beneficiaries b
-     LEFT JOIN visits v ON v.beneficiary_id = b.id
+     LEFT JOIN visits v ON v.beneficiary_id = b.id AND v.deleted_at IS NULL
      WHERE b.reference_number IS NOT NULL
        AND lower(trim(b.name)) = lower(trim($1))
        AND lower(trim(b.location)) = lower(trim($2))
@@ -181,7 +181,7 @@ async function findPossibleDuplicates(name, location) {
 }
 
 async function hasVisitBy(beneficiaryId, userId) {
-  const { rows } = await pool.query('SELECT 1 FROM visits WHERE beneficiary_id = $1 AND created_by = $2 LIMIT 1', [
+  const { rows } = await pool.query('SELECT 1 FROM visits WHERE beneficiary_id = $1 AND created_by = $2 AND deleted_at IS NULL LIMIT 1', [
     beneficiaryId,
     userId,
   ]);
@@ -192,7 +192,7 @@ async function hasVisitBy(beneficiaryId, userId) {
 async function latestFormData(beneficiaryId) {
   const { rows } = await pool.query(
     `SELECT form_data, visit_date FROM visits
-     WHERE beneficiary_id = $1 AND form_version = 2 AND form_data IS NOT NULL
+     WHERE beneficiary_id = $1 AND form_version = 2 AND form_data IS NOT NULL AND deleted_at IS NULL
      ORDER BY created_at DESC LIMIT 1`,
     [beneficiaryId]
   );

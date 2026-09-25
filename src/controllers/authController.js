@@ -25,6 +25,12 @@ async function login(req, res) {
     return res.status(401).json({ error: 'Invalid email or password' });
   }
 
+  // Only reachable with the right password, so it reveals nothing to a guesser.
+  if (user.deactivated_at) {
+    console.warn(`[auth] login refused for deactivated account ${JSON.stringify(normalizedEmail)} from ${req.ip}`);
+    return res.status(403).json({ error: 'This account has been deactivated. Contact your administrator.' });
+  }
+
   const { token } = signAccessToken(user);
   res.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role }, token });
 }

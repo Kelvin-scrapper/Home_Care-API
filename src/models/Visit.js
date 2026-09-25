@@ -84,9 +84,10 @@ function toVisit(row) {
 
 // Paginated via limit/offset (limit capped at 200, defaults to 50).
 // Volunteers only see visits they logged themselves; coordinators/
-// directors/admins see everything.
+// directors/admins see everything. Deleted visits are hidden everywhere
+// (every read in this file filters on deleted_at).
 async function list({ isOwnOnly, userId, limit, offset }) {
-  const whereClause = isOwnOnly ? 'WHERE created_by = $1' : '';
+  const whereClause = isOwnOnly ? 'WHERE deleted_at IS NULL AND created_by = $1' : 'WHERE deleted_at IS NULL';
   const scopeParams = isOwnOnly ? [userId] : [];
 
   const [countResult, rowsResult] = await Promise.all([
@@ -111,7 +112,7 @@ async function list({ isOwnOnly, userId, limit, offset }) {
 async function listByBeneficiary(beneficiaryId, { isOwnOnly, userId }) {
   const { rows } = await pool.query(
     `SELECT * FROM visits
-     WHERE beneficiary_id = $1 ${isOwnOnly ? 'AND created_by = $2' : ''}
+     WHERE beneficiary_id = $1 AND deleted_at IS NULL ${isOwnOnly ? 'AND created_by = $2' : ''}
      ORDER BY created_at DESC`,
     isOwnOnly ? [beneficiaryId, userId] : [beneficiaryId]
   );
@@ -137,7 +138,7 @@ async function create({ createdBy, beneficiaryId, data }) {
 // they logged themselves — scoped the same way as list().
 async function findById(id, { isOwnOnly, userId }) {
   const { rows } = await pool.query(
-    `SELECT * FROM visits WHERE id = $1 ${isOwnOnly ? 'AND created_by = $2' : ''}`,
+    `SELECT * FROM visits WHERE id = $1 AND deleted_at IS NULL ${isOwnOnly ? 'AND created_by = $2' : ''}`,
     isOwnOnly ? [id, userId] : [id]
   );
   return rows[0] ? toVisit(rows[0]) : null;
@@ -156,7 +157,7 @@ async function update(id, partialData) {
   const setClauses = columns.map((column, i) => `${column} = $${i + 2}`);
 
   const result = await pool.query(
-    `UPDATE visits SET ${setClauses.join(', ')} WHERE id = $1 RETURNING *`,
+    `UPDATE visits SET ${setClauses.join(', ')} WHERE id = $1 AND deleted_at IS NULL RETURNING *`,
     [id, ...values]
   );
   return toVisit(result.rows[0]);
@@ -204,7 +205,7 @@ async function updateV2(id, { formVersion, formData }) {
 
   const result = await pool.query(
     `UPDATE visits SET form_version = $2, form_data = $3, ${setClauses.join(', ')}
-     WHERE id = $1 RETURNING *`,
+     WHERE id = $1 AND deleted_at IS NULL RETURNING *`,
     [id, formVersion, formData, ...Object.values(row)]
   );
   return toVisit(result.rows[0]);
@@ -212,7 +213,7 @@ async function updateV2(id, { formVersion, formData }) {
 
 async function findFormById(id) {
   const { rows } = await pool.query(
-    'SELECT created_by, form_version, form_data FROM visits WHERE id = $1',
+    'SELECT created_by, form_version, form_data FROM visits WHERE id = $1 AND deleted_at IS NULL',
     [id]
   );
   return rows[0] || null;
@@ -221,7 +222,7 @@ async function findFormById(id) {
 // Every visit in scope for a spreadsheet export, oldest first. from/to are
 // optional YYYY-MM-DD bounds on the visit date (inclusive).
 async function listForExport({ isOwnOnly, userId, from, to }) {
-  const conditions = [];
+  const conditions = ['deleted_at IS NULL'];
   const params = [];
   if (isOwnOnly) {
     params.push(userId);
@@ -236,11 +237,82 @@ async function listForExport({ isOwnOnly, userId, from, to }) {
     conditions.push(`visit_date <= $${params.length}`);
   }
   const { rows } = await pool.query(
-    `SELECT * FROM visits ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
+    `SELECT * FROM visits WHERE ${conditions.join(' AND ')}
      ORDER BY visit_date ASC, id ASC`,
     params
   );
   return rows.map(toVisit);
 }
 
-module.exports = { listForExport, list, listByBeneficiary, create, update, createV2, updateV2, findFormById, findById, toVisit };
+// Hides a visit (recoverable). Returns false if it doesn't exist or is
+// already deleted.
+async function softDelete(id, deletedBy) {
+  const { rows } = await pool.query(
+    `UPDATE visits SET deleted_at = now(), deleted_by = $2
+     WHERE id = $1 AND deleted_at IS NULL RETURNING id`,
+    [id, deletedBy]
+  );
+  return rows.length > 0;
+}
+
+// Brings a deleted visit back. Returns the visit, or null if it isn't in the bin.
+async function restore(id) {
+  const { rows } = await pool.query(
+    `UPDATE visits SET deleted_at = NULL, deleted_by = NULL
+     WHERE id = $1 AND deleted_at IS NOT NULL RETURNING *`,
+    [id]
+  );
+  return rows[0] ? toVisit(rows[0]) : null;
+}
+
+// Deleted visits still recoverable, newest deletion first.
+async function listDeleted(retentionDays) {
+  const { rows } = await pool.query(
+    `SELECT v.id, v.beneficiary_name, v.location, v.visit_date, v.volunteer_name,
+            v.deleted_at, u.name AS deleted_by_name,
+            v.deleted_at + make_interval(days => $1) AS purge_at
+     FROM visits v LEFT JOIN users u ON u.id = v.deleted_by
+     WHERE v.deleted_at IS NOT NULL
+     ORDER BY v.deleted_at DESC`,
+    [retentionDays]
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    beneficiaryName: r.beneficiary_name,
+    location: r.location,
+    visitDate: r.visit_date,
+    volunteerName: r.volunteer_name,
+    deletedAt: r.deleted_at,
+    deletedByName: r.deleted_by_name,
+    purgeAt: r.purge_at,
+  }));
+}
+
+// Permanently removes visits deleted more than `days` ago. Their uploads are
+// then unattached, and the upload cleanup job removes the files.
+async function purgeDeletedOlderThan(days) {
+  const { rows } = await pool.query(
+    `DELETE FROM visits
+     WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => $1)
+     RETURNING id`,
+    [days]
+  );
+  return rows.map((r) => r.id);
+}
+
+module.exports = {
+  listForExport,
+  list,
+  listByBeneficiary,
+  create,
+  update,
+  createV2,
+  updateV2,
+  findFormById,
+  findById,
+  toVisit,
+  softDelete,
+  restore,
+  listDeleted,
+  purgeDeletedOlderThan,
+};

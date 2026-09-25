@@ -8,8 +8,11 @@
 // stored as boolean) | file (stored as { id, name, mimeType, size }).
 // showIf hides a section/field unless another field has the given value;
 // hidden fields are never required and are dropped on save.
+// optionsFrom: a select whose choices depend on another field's value
+// (ward -> the wards of the chosen constituency).
 
 const { CONSTITUENCIES_BY_COUNTY } = require('./kenyaConstituencies');
+const { WARDS_BY_CONSTITUENCY } = require('./kenyaWards');
 
 const FORM_VERSION = 2;
 
@@ -41,12 +44,11 @@ const SECTIONS = [
       {
         name: 'referenceNumber',
         label: 'Beneficiary/Household Reference Number',
-        hint: 'Use the unique BHECO reference number assigned to the beneficiary/household (BHECO-ward-number), e.g. BHECO-NK-001. For a new beneficiary, fill in the Ward and tap Generate new ID.',
+        hint: 'Use the unique BHECO reference number assigned to the beneficiary/household (BHECO-ward-number), e.g. BHECO-NK-001. For a new beneficiary, choose the Constituency and Ward and tap Generate new ID.',
         type: 'text',
         required: true,
       },
       { name: 'villageArea', label: 'Village/Area', type: 'text', required: true },
-      { name: 'ward', label: 'Ward', type: 'text', required: true },
       {
         name: 'constituency',
         label: 'Constituency',
@@ -54,6 +56,13 @@ const SECTIONS = [
         required: true,
         optionGroups: CONSTITUENCIES_BY_COUNTY.map((g) => ({ label: g.county, options: g.options })),
         options: CONSTITUENCIES_BY_COUNTY.flatMap((g) => g.options),
+      },
+      {
+        name: 'ward',
+        label: 'Ward',
+        type: 'select',
+        required: true,
+        optionsFrom: { field: 'constituency', options: WARDS_BY_CONSTITUENCY },
       },
     ],
   },
@@ -473,6 +482,12 @@ function isVisible(rule, values) {
   return !rule || values[rule.field] === rule.equals;
 }
 
+// The allowed choices of an optionsFrom field, given the other field's value.
+function dependentOptions(field, values) {
+  const parent = values[field.optionsFrom.field];
+  return (typeof parent === 'string' && field.optionsFrom.options[parent.trim()]) || [];
+}
+
 // Returns { data, errors }. `data` holds only known, visible fields, cleaned
 // (trimmed strings, deduped option arrays); `errors` maps field name to a
 // message. File fields are only shape-checked here — the caller must confirm
@@ -533,6 +548,8 @@ function validateVisitForm(input) {
             errors[field.name] = 'Too long';
           } else if (trimmed && field.options && !field.options.includes(trimmed)) {
             errors[field.name] = 'Invalid option selected';
+          } else if (trimmed && field.optionsFrom && !dependentOptions(field, values).includes(trimmed)) {
+            errors[field.name] = 'Choose an option from the list for the selected constituency';
           } else if (trimmed && field.type === 'date' && !DATE_PATTERN.test(trimmed)) {
             errors[field.name] = 'Invalid date';
           } else {

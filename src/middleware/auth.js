@@ -21,9 +21,9 @@ async function authenticate(req, res, next) {
     return res.status(401).json({ error: 'Token has been revoked' });
   }
 
-  const user = await User.findById(decoded.sub);
+  const user = await User.findActiveById(decoded.sub);
   if (!user) {
-    return res.status(401).json({ error: 'User no longer exists' });
+    return res.status(401).json({ error: 'This account is no longer active' });
   }
 
   req.user = user;

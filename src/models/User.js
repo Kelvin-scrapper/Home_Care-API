@@ -16,33 +16,44 @@ const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', SALT_ROUNDS);
 
 // Case-insensitive, so accounts created with a differently-cased email can
 // still sign in. Callers pass an already trimmed/lowercased email.
+// What the admin user list and edit endpoints return.
+const PUBLIC_COLUMNS = `id, name, email, role, created_at AS "createdAt",
+  deactivated_at IS NULL AS active, deactivated_at AS "deactivatedAt"`;
+
 async function findByEmail(email) {
   const { rows } = await pool.query(
-    'SELECT id, name, email, role, password_hash FROM users WHERE lower(email) = lower($1)',
+    'SELECT id, name, email, role, password_hash, deactivated_at FROM users WHERE lower(email) = lower($1)',
     [email]
   );
   return rows[0] || null;
 }
 
-async function findById(id) {
+// The signed-in user for an authenticated request. Deactivated accounts
+// aren't returned, so their sessions end on the next request.
+async function findActiveById(id) {
   const { rows } = await pool.query(
-    'SELECT id, name, email, role FROM users WHERE id = $1',
+    'SELECT id, name, email, role FROM users WHERE id = $1 AND deactivated_at IS NULL',
     [id]
   );
   return rows[0] || null;
 }
 
+// Any account, active or not (for admin edits).
+async function findById(id) {
+  const { rows } = await pool.query(`SELECT ${PUBLIC_COLUMNS} FROM users WHERE id = $1`, [id]);
+  return rows[0] || null;
+}
+
 async function list() {
-  const { rows } = await pool.query(
-    `SELECT id, name, email, role, created_at AS "createdAt"
-     FROM users
-     ORDER BY created_at ASC`
-  );
+  const { rows } = await pool.query(`SELECT ${PUBLIC_COLUMNS} FROM users ORDER BY created_at ASC`);
   return rows;
 }
 
-async function countByRole(role) {
-  const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM users WHERE role = $1', [role]);
+async function countActiveByRole(role) {
+  const { rows } = await pool.query(
+    'SELECT COUNT(*)::int AS count FROM users WHERE role = $1 AND deactivated_at IS NULL',
+    [role]
+  );
   return rows[0].count;
 }
 
@@ -51,15 +62,16 @@ async function create({ name, email, password, role }) {
   const { rows } = await pool.query(
     `INSERT INTO users (name, email, password_hash, role)
      VALUES ($1, $2, $3, $4)
-     RETURNING id, name, email, role, created_at AS "createdAt"`,
+     RETURNING ${PUBLIC_COLUMNS}`,
     [name, email, passwordHash, role]
   );
   return rows[0];
 }
 
 // Only the fields present in `changes` are touched. `password`, if given, is
-// hashed here. Returns null if the user doesn't exist.
-async function update(id, { name, email, role, password }) {
+// hashed here; `active: false` deactivates, `active: true` reactivates.
+// Returns null if the user doesn't exist.
+async function update(id, { name, email, role, password, active }) {
   const values = [id];
   const sets = [];
   const set = (column, value) => {
@@ -71,10 +83,12 @@ async function update(id, { name, email, role, password }) {
   if (email !== undefined) set('email', email);
   if (role !== undefined) set('role', role);
   if (password !== undefined) set('password_hash', await bcrypt.hash(password, SALT_ROUNDS));
+  // Keeps the original deactivation time if an inactive account is saved again.
+  if (active === false) sets.push('deactivated_at = COALESCE(deactivated_at, now())');
+  if (active === true) sets.push('deactivated_at = NULL');
 
   const { rows } = await pool.query(
-    `UPDATE users SET ${sets.join(', ')} WHERE id = $1
-     RETURNING id, name, email, role, created_at AS "createdAt"`,
+    `UPDATE users SET ${sets.join(', ')} WHERE id = $1 RETURNING ${PUBLIC_COLUMNS}`,
     values
   );
   return rows[0] || null;
@@ -93,9 +107,10 @@ module.exports = {
   MIN_PASSWORD_LENGTH,
   MAX_PASSWORD_LENGTH,
   findByEmail,
+  findActiveById,
   findById,
   list,
-  countByRole,
+  countActiveByRole,
   create,
   update,
   verifyPassword,

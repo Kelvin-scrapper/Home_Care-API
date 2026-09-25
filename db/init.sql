@@ -139,6 +139,17 @@ CREATE TABLE IF NOT EXISTS uploads (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Deactivated accounts can't sign in (and any session they have ends), but
+-- stay on the visits they recorded; an Admin can reactivate them.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMPTZ;
+
+-- Deleted visits are hidden everywhere but kept (with their files) so an
+-- Admin can restore them; src/jobs/purgeDeletedVisits.js removes them for
+-- good after VISIT_TRASH_RETENTION_DAYS.
+ALTER TABLE visits ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE visits ADD COLUMN IF NOT EXISTS deleted_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_visits_deleted_at ON visits (deleted_at) WHERE deleted_at IS NOT NULL;
+
 -- Last number handed out per ward code for generated reference numbers
 -- (BHECO-<code>-<number>). Reserving through this table keeps two officers
 -- generating at the same moment from ever getting the same number.
