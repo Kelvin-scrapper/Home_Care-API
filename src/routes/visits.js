@@ -2,6 +2,7 @@ const express = require('express');
 const { authenticate, requireRole } = require('../middleware/auth');
 const {
   list,
+  filterOptions,
   detail,
   create,
   update,
@@ -17,6 +18,7 @@ const FIELD_STAFF = ['Volunteer/CHW', 'Coordinator/Field officer'];
 
 router.get('/', authenticate, list);
 router.get('/export', authenticate, exportVisits);
+router.get('/filter-options', authenticate, filterOptions);
 router.get('/deleted', authenticate, requireRole('Admin'), listDeleted);
 router.get('/:id', authenticate, detail);
 router.post('/', authenticate, requireRole(...FIELD_STAFF), create);

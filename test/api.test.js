@@ -344,6 +344,43 @@ describe('visits', () => {
     assert.equal((await t.request('GET', '/visits', tokens.vol2)).body.total, 0);
   });
 
+  it('searches and filters the list', async () => {
+    const get = async (query, token = tokens.dir) => (await t.request('GET', `/visits?limit=200&${query}`, token)).body;
+
+    const byName = await get('q=WANJ');
+    assert.ok(byName.total > 0 && byName.visits.every((v) => v.beneficiaryName === 'Mary Wanjiru'));
+    // Matches original-form visits too, through their beneficiary's reference number.
+    const byRef = await get(`q=${encodeURIComponent(state.maryRef.toLowerCase())}`);
+    assert.ok(byRef.visits.some((v) => v.formVersion === 1));
+    assert.ok(byRef.visits.every((v) => v.beneficiaryId === 1));
+    assert.equal((await get('q=%25')).total, 0, 'wildcards are matched literally');
+
+    const urgent = await get('urgency=urgent');
+    assert.equal(urgent.total, 1);
+    assert.equal(urgent.visits[0].urgencyLevel, 'Urgent');
+    assert.equal((await get('urgency=routine')).total, 6);
+
+    assert.ok((await get('officer=Vera')).visits.every((v) => v.volunteerName === 'Vera'));
+    assert.equal((await get('officer=Nobody')).total, 0);
+    const ward = await get('ward=Nakuru%20East');
+    assert.ok(ward.total > 0 && ward.visits.every((v) => v.formData.ward === 'Nakuru East'));
+    const day = await get('from=2026-09-21&to=2026-09-21');
+    assert.ok(day.total > 0 && day.visits.every((v) => v.visitDate === '2026-09-21'));
+    assert.equal((await get('q=wanjiru&urgency=urgent')).total, 1, 'filters combine');
+
+    assert.equal((await get('q=wanjiru', tokens.vol2)).total, 0, 'volunteers stay scoped');
+    assert.equal((await t.request('GET', '/visits?urgency=soon', tokens.dir)).status, 400);
+    assert.equal((await t.request('GET', '/visits?from=21-09-2026', tokens.dir)).status, 400);
+  });
+
+  it('offers the officers and wards in scope as filter options', async () => {
+    const all = (await t.request('GET', '/visits/filter-options', tokens.dir)).body;
+    assert.ok(all.officers.includes('Vera'));
+    assert.deepEqual(all.wards, ['Nakuru East']);
+    assert.deepEqual((await t.request('GET', '/visits/filter-options', tokens.vol2)).body, { officers: [], wards: [] });
+    assert.equal((await t.request('GET', '/visits/filter-options')).status, 401);
+  });
+
   it('shows one visit to those allowed to see it', async () => {
     assert.equal((await t.request('GET', `/visits/${state.maryVisit.id}`, tokens.dir)).body.formData.referenceNumber, state.maryRef);
     assert.equal((await t.request('GET', `/visits/${state.maryVisit.id}`, tokens.vol2)).status, 404);
@@ -467,6 +504,15 @@ describe('export', () => {
     assert.equal(csv.trim().split('\r\n').length, 1, 'header only');
     assert.equal((await t.request('GET', '/visits/export?from=yesterday', tokens.dir)).status, 400);
     assert.equal((await t.request('GET', '/visits/export')).status, 401);
+  });
+
+  it('exports exactly what the filtered list shows', async () => {
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load((await t.request('GET', '/visits/export?urgency=urgent', tokens.dir)).buffer);
+    assert.equal(workbook.getWorksheet('Visits').rowCount, 1 + 1);
+    const zip = await JSZip.loadAsync((await t.request('GET', '/visits/export?format=zip&q=nobody-by-this-name', tokens.dir)).buffer);
+    assert.equal(Object.keys(zip.files).filter((n) => n.startsWith('files/')).length, 0);
+    assert.equal((await t.request('GET', '/visits/export?urgency=soon', tokens.dir)).status, 400);
   });
 
   it('downloads a ZIP with the spreadsheets and every attached file, byte for byte', async () => {

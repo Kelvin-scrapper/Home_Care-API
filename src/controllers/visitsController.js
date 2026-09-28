@@ -54,17 +54,53 @@ async function prepareV2Form(body, user, previousFormData) {
   return { formData: data };
 }
 
-// List visits. Volunteers only see visits they logged themselves;
-// coordinators/directors/admins see everything. Paginated via
-// ?limit=&offset= (limit capped at 200, defaults to 50).
+// The list/export filters from the query string (?q=&urgency=urgent|routine
+// &officer=&ward=&from=&to=), scoped to what the user may see. Returns
+// { filters } or { error } for a 400.
+function parseVisitFilters(req) {
+  const text = (value) => (typeof value === 'string' ? value.trim().slice(0, 200) : '');
+  const { from, to, urgency } = req.query;
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  for (const value of [from, to]) {
+    if (value !== undefined && value !== '' && (typeof value !== 'string' || !datePattern.test(value))) {
+      return { error: 'from and to must be dates in YYYY-MM-DD format' };
+    }
+  }
+  if (urgency !== undefined && urgency !== '' && !['urgent', 'routine'].includes(urgency)) {
+    return { error: 'urgency must be "urgent" or "routine"' };
+  }
+  return {
+    filters: {
+      isOwnOnly: req.user.role === 'Volunteer/CHW',
+      userId: req.user.id,
+      q: text(req.query.q),
+      urgency: urgency || '',
+      officer: text(req.query.officer),
+      ward: text(req.query.ward),
+      from: from || '',
+      to: to || '',
+    },
+  };
+}
+
+// List visits, newest first. Volunteers only see visits they logged
+// themselves; coordinators/directors/admins see everything. Paginated via
+// ?limit=&offset= (limit capped at 200, defaults to 50); filters above.
 async function list(req, res) {
-  const user = req.user;
-  const isOwnOnly = user.role === 'Volunteer/CHW';
+  const { filters, error } = parseVisitFilters(req);
+  if (error) {
+    return res.status(400).json({ error });
+  }
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
   const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
-  const { visits, total } = await Visit.list({ isOwnOnly, userId: user.id, limit, offset });
+  const { visits, total } = await Visit.list({ ...filters, limit, offset });
   res.json({ visits, total, limit, offset });
+}
+
+// Officers and wards to offer in the Visits list filters.
+async function filterOptions(req, res) {
+  res.json(await Visit.filterOptions({ isOwnOnly: req.user.role === 'Volunteer/CHW', userId: req.user.id }));
 }
 
 // A single visit, e.g. to pre-fill an edit form. Same visibility rule as
@@ -193,24 +229,16 @@ async function update(req, res) {
   res.json(updated);
 }
 
-// Download visits as a spreadsheet (?format=xlsx|csv, optional ?from=&to=
-// visit-date range). Same visibility rule as list().
+// Download visits (?format=xlsx|csv|zip). Takes the same filters and
+// visibility rule as list(), so it holds exactly the visits the list shows.
 async function exportVisits(req, res) {
   const format = ['csv', 'zip'].includes(req.query.format) ? req.query.format : 'xlsx';
-  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
-  const { from, to } = req.query;
-  for (const value of [from, to]) {
-    if (value !== undefined && (typeof value !== 'string' || !datePattern.test(value))) {
-      return res.status(400).json({ error: 'from and to must be dates in YYYY-MM-DD format' });
-    }
+  const { filters, error } = parseVisitFilters(req);
+  if (error) {
+    return res.status(400).json({ error });
   }
 
-  const visits = await Visit.listForExport({
-    isOwnOnly: req.user.role === 'Volunteer/CHW',
-    userId: req.user.id,
-    from,
-    to,
-  });
+  const visits = await Visit.listForExport(filters);
 
   const stamp = new Date().toISOString().slice(0, 10);
   if (format === 'zip') {
@@ -264,4 +292,4 @@ async function restore(req, res) {
   res.json(visit);
 }
 
-module.exports = { list, detail, create, update, exportVisits, remove, listDeleted, restore };
+module.exports = { list, filterOptions, detail, create, update, exportVisits, remove, listDeleted, restore };

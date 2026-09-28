@@ -82,22 +82,56 @@ function toVisit(row) {
   return visit;
 }
 
-// Paginated via limit/offset (limit capped at 200, defaults to 50).
-// Volunteers only see visits they logged themselves; coordinators/
-// directors/admins see everything. Deleted visits are hidden everywhere
+// WHERE conditions shared by the visit list and the export, so a download
+// holds exactly the visits the list shows. All filters are optional:
+//   q        beneficiary name or reference number (case-insensitive, partial)
+//   urgency  'urgent' | 'routine'
+//   officer  exact field officer name
+//   ward     exact ward (new-form visits only; older visits have none)
+//   from/to  YYYY-MM-DD bounds on the visit date, inclusive
+// Volunteers only see visits they logged themselves (isOwnOnly).
+function filterConditions({ isOwnOnly, userId, q, urgency, officer, ward, from, to }) {
+  const conditions = ['deleted_at IS NULL'];
+  const params = [];
+  const add = (value) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+
+  if (isOwnOnly) conditions.push(`created_by = ${add(userId)}`);
+  if (q) {
+    const pattern = add(`%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+    conditions.push(
+      `(beneficiary_name ILIKE ${pattern}
+        OR form_data->>'referenceNumber' ILIKE ${pattern}
+        OR EXISTS (SELECT 1 FROM beneficiaries b
+                   WHERE b.id = visits.beneficiary_id AND b.reference_number ILIKE ${pattern}))`
+    );
+  }
+  if (urgency === 'urgent') conditions.push(`urgency_level = 'Urgent'`);
+  if (urgency === 'routine') conditions.push(`urgency_level IS DISTINCT FROM 'Urgent'`);
+  if (officer) conditions.push(`volunteer_name = ${add(officer)}`);
+  if (ward) conditions.push(`form_data->>'ward' = ${add(ward)}`);
+  if (from) conditions.push(`visit_date >= ${add(from)}`);
+  if (to) conditions.push(`visit_date <= ${add(to)}`);
+
+  return { where: conditions.join(' AND '), params };
+}
+
+// Paginated via limit/offset (limit capped at 200, defaults to 50), newest
+// first, narrowed by the filters above. Deleted visits are hidden everywhere
 // (every read in this file filters on deleted_at).
-async function list({ isOwnOnly, userId, limit, offset }) {
-  const whereClause = isOwnOnly ? 'WHERE deleted_at IS NULL AND created_by = $1' : 'WHERE deleted_at IS NULL';
-  const scopeParams = isOwnOnly ? [userId] : [];
+async function list({ limit, offset, ...filters }) {
+  const { where, params } = filterConditions(filters);
 
   const [countResult, rowsResult] = await Promise.all([
-    pool.query(`SELECT COUNT(*)::int AS count FROM visits ${whereClause}`, scopeParams),
+    pool.query(`SELECT COUNT(*)::int AS count FROM visits WHERE ${where}`, params),
     pool.query(
       `SELECT * FROM visits
-       ${whereClause}
+       WHERE ${where}
        ORDER BY created_at DESC
-       LIMIT $${scopeParams.length + 1} OFFSET $${scopeParams.length + 2}`,
-      [...scopeParams, limit, offset]
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
     ),
   ]);
 
@@ -219,29 +253,35 @@ async function findFormById(id) {
   return rows[0] || null;
 }
 
-// Every visit in scope for a spreadsheet export, oldest first. from/to are
-// optional YYYY-MM-DD bounds on the visit date (inclusive).
-async function listForExport({ isOwnOnly, userId, from, to }) {
-  const conditions = ['deleted_at IS NULL'];
-  const params = [];
-  if (isOwnOnly) {
-    params.push(userId);
-    conditions.push(`created_by = $${params.length}`);
-  }
-  if (from) {
-    params.push(from);
-    conditions.push(`visit_date >= $${params.length}`);
-  }
-  if (to) {
-    params.push(to);
-    conditions.push(`visit_date <= $${params.length}`);
-  }
+// Every visit matching the list filters, for a spreadsheet/ZIP export,
+// oldest first.
+async function listForExport(filters) {
+  const { where, params } = filterConditions(filters);
   const { rows } = await pool.query(
-    `SELECT * FROM visits WHERE ${conditions.join(' AND ')}
+    `SELECT * FROM visits WHERE ${where}
      ORDER BY visit_date ASC, id ASC`,
     params
   );
   return rows.map(toVisit);
+}
+
+// The field officers and wards that appear on visits in scope, for the
+// Visits list filter dropdowns.
+async function filterOptions({ isOwnOnly, userId }) {
+  const { where, params } = filterConditions({ isOwnOnly, userId });
+  const [officers, wards] = await Promise.all([
+    pool.query(
+      `SELECT DISTINCT volunteer_name AS value FROM visits
+       WHERE ${where} AND volunteer_name <> '' ORDER BY 1`,
+      params
+    ),
+    pool.query(
+      `SELECT DISTINCT form_data->>'ward' AS value FROM visits
+       WHERE ${where} AND COALESCE(form_data->>'ward', '') <> '' ORDER BY 1`,
+      params
+    ),
+  ]);
+  return { officers: officers.rows.map((r) => r.value), wards: wards.rows.map((r) => r.value) };
 }
 
 // Hides a visit (recoverable). Returns false if it doesn't exist or is
@@ -302,6 +342,7 @@ async function purgeDeletedOlderThan(days) {
 
 module.exports = {
   listForExport,
+  filterOptions,
   list,
   listByBeneficiary,
   create,
