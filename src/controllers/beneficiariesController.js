@@ -8,7 +8,8 @@ async function list(req, res) {
   const user = req.user;
   const isOwnOnly = user.role === 'Volunteer/CHW';
 
-  const beneficiaries = await Beneficiary.list({ isOwnOnly, userId: user.id });
+  const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 200) : '';
+  const beneficiaries = await Beneficiary.list({ isOwnOnly, userId: user.id, q });
   res.json(beneficiaries);
 }
 

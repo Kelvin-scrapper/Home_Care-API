@@ -583,7 +583,12 @@ function normalizeReferenceNumber(value) {
   return value.replace(/\s+/g, '').toUpperCase();
 }
 
+// The reference number of a new beneficiary recorded with no signal: the
+// real one is assigned (for their ward) when the visit reaches the server.
+const PENDING_REFERENCE = 'NEW-ID';
+
 module.exports = {
+  PENDING_REFERENCE,
   FORM_VERSION,
   SECTIONS,
   FILE_KINDS,

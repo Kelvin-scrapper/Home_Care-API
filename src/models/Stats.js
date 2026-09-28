@@ -25,9 +25,16 @@ async function getDashboard({ isOwnOnly, userId }) {
        WHERE ${scopeClause} AND created_at >= date_trunc('week', now())`,
       scopeParams
     ),
+    // Open follow-ups, and how many of them are due by the end of this week
+    // (overdue included; those without a date count as due).
     pool.query(
-      `SELECT COUNT(*)::int AS count FROM visits
-       WHERE ${scopeClause}
+      `SELECT COUNT(*)::int AS count,
+              COUNT(*) FILTER (
+                WHERE COALESCE(NULLIF(form_data->>'followUpDate', ''), '0000-00-00')
+                      <= to_char(date_trunc('week', now()) + interval '6 days', 'YYYY-MM-DD')
+              )::int AS due_this_week
+       FROM visits
+       WHERE ${scopeClause} AND follow_up_done_at IS NULL
          AND (urgency_level = 'Follow-up Needed' OR form_data->>'followUpRequired' = 'Yes')`,
       scopeParams
     ),
@@ -73,6 +80,7 @@ async function getDashboard({ isOwnOnly, userId }) {
   return {
     myVisitsThisWeek: myVisitsThisWeek.rows[0].count,
     pendingFollowUps: pendingFollowUps.rows[0].count,
+    followUpsDueThisWeek: pendingFollowUps.rows[0].due_this_week,
     recentSubmissions: recentSubmissions.rows.map((r) => ({
       id: r.id,
       name: r.beneficiary_name,
@@ -93,4 +101,71 @@ async function getDashboard({ isOwnOnly, userId }) {
   };
 }
 
-module.exports = { getDashboard };
+// Kitchen garden stages, in the order a garden moves through them.
+const GARDEN_STAGES = ['Not started', 'Site identified', 'Garden Established', 'Crops Planted', 'Producing Food'];
+
+// Counts of a multi-choice answer across all visits (e.g. support provided).
+function answerCounts(field) {
+  return pool.query(
+    `SELECT answer AS label, COUNT(*)::int AS count
+     FROM visits,
+          jsonb_array_elements_text(
+            CASE WHEN jsonb_typeof(form_data->'${field}') = 'array' THEN form_data->'${field}' ELSE '[]'::jsonb END
+          ) AS answer
+     WHERE deleted_at IS NULL
+     GROUP BY answer
+     ORDER BY count DESC, answer`
+  );
+}
+
+// The programme's reach, from what the form records: visits per month (the
+// last 12, by visit date), visits per ward, the kinds of urgent concern, the
+// support given, and where each household's kitchen garden stands (its most
+// recent answer).
+async function getImpact() {
+  const [byMonth, byWard, concerns, support, gardens] = await Promise.all([
+    pool.query(
+      `SELECT to_char(m, 'YYYY-MM') AS month, COUNT(v.id)::int AS count
+       FROM generate_series(
+              date_trunc('month', now()) - interval '11 months',
+              date_trunc('month', now()),
+              interval '1 month'
+            ) AS m
+       LEFT JOIN visits v
+         ON v.deleted_at IS NULL
+        AND v.visit_date ~ '^[0-9]{4}-[0-9]{2}'
+        AND substring(v.visit_date from 1 for 7) = to_char(m, 'YYYY-MM')
+       GROUP BY m
+       ORDER BY m`
+    ),
+    pool.query(
+      `SELECT COALESCE(NULLIF(form_data->>'ward', ''), 'Not recorded') AS label, COUNT(*)::int AS count
+       FROM visits WHERE deleted_at IS NULL
+       GROUP BY 1 ORDER BY count DESC, label`
+    ),
+    answerCounts('urgentConcernTypes'),
+    answerCounts('supportProvided'),
+    pool.query(
+      `SELECT status AS label, COUNT(*)::int AS count
+       FROM (
+         SELECT DISTINCT ON (beneficiary_id) form_data->>'gardenStatus' AS status
+         FROM visits
+         WHERE deleted_at IS NULL AND beneficiary_id IS NOT NULL
+           AND COALESCE(form_data->>'gardenStatus', '') <> ''
+         ORDER BY beneficiary_id, created_at DESC
+       ) latest
+       GROUP BY status`
+    ),
+  ]);
+
+  const gardenCounts = new Map(gardens.rows.map((r) => [r.label, r.count]));
+  return {
+    visitsByMonth: byMonth.rows,
+    visitsByWard: byWard.rows,
+    urgentConcerns: concerns.rows,
+    supportProvided: support.rows,
+    gardenStages: GARDEN_STAGES.map((label) => ({ label, count: gardenCounts.get(label) || 0 })),
+  };
+}
+
+module.exports = { getDashboard, getImpact };

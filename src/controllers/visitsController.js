@@ -9,7 +9,10 @@ const {
   validateVisitForm,
   fileFields,
   normalizeReferenceNumber,
+  PENDING_REFERENCE,
 } = require('../schemas/visitFormDefinition');
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Validates a v2 submission and swaps each file reference for the stored
 // upload's metadata. Returns { formData } or { status, body } on failure.
@@ -22,8 +25,7 @@ async function prepareV2Form(body, user, previousFormData) {
   data.referenceNumber = normalizeReferenceNumber(data.referenceNumber);
 
   const fields = fileFields().filter((f) => data[f.name]);
-  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const invalid = fields.find((f) => !uuidPattern.test(data[f.name].id));
+  const invalid = fields.find((f) => !UUID_PATTERN.test(data[f.name].id));
   if (invalid) {
     return { status: 400, body: { error: 'Invalid file', fieldErrors: { [invalid.name]: 'Invalid file' } } };
   }
@@ -126,15 +128,32 @@ async function detail(req, res) {
 // enforced by requireRole on the route.
 async function create(req, res) {
   if (req.body?.formVersion === FORM_VERSION) {
+    // Sent from a phone's offline queue: a resend of something already
+    // recorded returns that visit instead of creating another.
+    const rawSubmissionId = req.body.clientSubmissionId;
+    if (rawSubmissionId !== undefined && !(typeof rawSubmissionId === 'string' && UUID_PATTERN.test(rawSubmissionId))) {
+      return res.status(400).json({ error: 'Invalid clientSubmissionId' });
+    }
+    const clientSubmissionId = rawSubmissionId ?? null;
+    if (clientSubmissionId) {
+      const already = await Visit.findBySubmissionId(req.user.id, clientSubmissionId);
+      if (already) return res.status(200).json(already);
+    }
+
     const prepared = await prepareV2Form(req.body, req.user, null);
     if (!prepared.formData) {
       return res.status(prepared.status).json(prepared.body);
     }
     const { formData } = prepared;
+    // Recorded offline for someone new: their ID is assigned now.
+    const assignReference = formData.referenceNumber === PENDING_REFERENCE;
 
     // A new reference number for a name + village that already has one is
     // probably the same person registered twice — ask before creating them.
-    if (req.body.confirmNewBeneficiary !== true && !(await Beneficiary.findIdByReference(formData.referenceNumber))) {
+    if (
+      req.body.confirmNewBeneficiary !== true &&
+      (assignReference || !(await Beneficiary.findIdByReference(formData.referenceNumber)))
+    ) {
       const possibleDuplicates = await Beneficiary.findPossibleDuplicates(formData.beneficiaryName, formData.villageArea);
       if (possibleDuplicates.length > 0) {
         return res.status(409).json({
@@ -142,6 +161,17 @@ async function create(req, res) {
           possibleDuplicates,
         });
       }
+    }
+
+    if (assignReference) {
+      const generated = await Beneficiary.generateReferenceNumber(formData.ward);
+      if (!generated) {
+        return res.status(400).json({
+          error: 'Please complete all required fields',
+          fieldErrors: { ward: 'Choose the ward so a reference number can be assigned' },
+        });
+      }
+      formData.referenceNumber = generated;
     }
 
     const beneficiaryId = await Beneficiary.findOrCreateByReference({
@@ -156,6 +186,7 @@ async function create(req, res) {
       beneficiaryId,
       formVersion: FORM_VERSION,
       formData,
+      clientSubmissionId,
     });
     return res.status(201).json(visit);
   }
@@ -206,6 +237,12 @@ async function update(req, res) {
     if (!prepared.formData) {
       return res.status(prepared.status).json(prepared.body);
     }
+    if (prepared.formData.referenceNumber === PENDING_REFERENCE) {
+      return res.status(400).json({
+        error: 'Please complete all required fields',
+        fieldErrors: { referenceNumber: 'An existing visit keeps its reference number' },
+      });
+    }
     const visit = await Visit.updateV2(visitId, { formVersion: FORM_VERSION, formData: prepared.formData });
     return res.json(visit);
   }
@@ -255,6 +292,41 @@ async function exportVisits(req, res) {
   res.send(Buffer.from(await toXlsx(visits)));
 }
 
+// ?status=open (default) or done.
+async function listFollowUps(req, res) {
+  const status = req.query.status === 'done' ? 'done' : 'open';
+  res.json(
+    await Visit.listFollowUps({ isOwnOnly: req.user.role === 'Volunteer/CHW', userId: req.user.id, status })
+  );
+}
+
+// POST marks the follow-up done ({ note } optional), DELETE reopens it.
+// Coordinators may do this for any visit, volunteers for their own.
+async function setFollowUp(req, res) {
+  const visitId = visitIdFrom(req);
+  if (visitId === null) {
+    return res.status(400).json({ error: 'Invalid visit id' });
+  }
+  const done = req.method === 'POST';
+  const note = typeof req.body?.note === 'string' ? req.body.note.trim() : '';
+  if (note.length > 2000) {
+    return res.status(400).json({ error: 'The note is too long' });
+  }
+
+  const existing = await Visit.findFormById(visitId);
+  if (!existing) {
+    return res.status(404).json({ error: 'Visit not found' });
+  }
+  if (req.user.role === 'Volunteer/CHW' && existing.created_by !== req.user.id) {
+    return res.status(404).json({ error: 'Visit not found' });
+  }
+  if (!(await Visit.setFollowUpDone(visitId, { done, userId: req.user.id, note }))) {
+    return res.status(400).json({ error: 'This visit did not ask for a follow-up' });
+  }
+  console.info(`[visits] user ${req.user.id} ${done ? 'completed' : 'reopened'} the follow-up of visit ${visitId}`);
+  res.json(await Visit.findById(visitId, { isOwnOnly: false }));
+}
+
 function visitIdFrom(req) {
   const id = parseInt(req.params.id, 10);
   return Number.isInteger(id) ? id : null;
@@ -292,4 +364,4 @@ async function restore(req, res) {
   res.json(visit);
 }
 
-module.exports = { list, filterOptions, detail, create, update, exportVisits, remove, listDeleted, restore };
+module.exports = { list, filterOptions, detail, create, update, exportVisits, remove, listDeleted, restore, listFollowUps, setFollowUp };

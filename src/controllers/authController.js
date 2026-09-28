@@ -45,4 +45,13 @@ async function me(req, res) {
   res.json(req.user);
 }
 
-module.exports = { login, logout, me };
+// A fresh token for a still-valid session, so someone using the app is never
+// signed out mid-task. The old token is left to expire on its own rather than
+// revoked: on a patchy connection the reply can be lost, and the app must
+// still be able to use the token it has.
+async function refresh(req, res) {
+  const { token } = signAccessToken(req.user);
+  res.json({ user: req.user, token });
+}
+
+module.exports = { login, logout, me, refresh };

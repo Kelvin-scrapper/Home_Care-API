@@ -11,4 +11,10 @@ async function dashboard(req, res) {
   res.json(stats);
 }
 
-module.exports = { dashboard };
+// Programme-wide figures for the charts (not for volunteers, who only see
+// their own visits).
+async function impact(req, res) {
+  res.json(await Stats.getImpact());
+}
+
+module.exports = { dashboard, impact };

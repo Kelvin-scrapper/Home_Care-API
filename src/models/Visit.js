@@ -75,11 +75,92 @@ function toVisit(row) {
     createdAt: row.created_at,
     formVersion: row.form_version,
     formData: row.form_data,
+    followUpDoneAt: row.follow_up_done_at ?? null,
+    followUpDoneBy: row.follow_up_done_by ?? null,
+    followUpNote: row.follow_up_note ?? null,
   };
   for (const [key, column] of Object.entries(FIELD_MAP)) {
     visit[key] = row[column];
   }
   return visit;
+}
+
+// Visits that asked for a follow-up: "Follow-up required: Yes" on the new
+// form, or "Follow-up Needed" on the original one.
+const NEEDS_FOLLOW_UP = `(v.form_data->>'followUpRequired' = 'Yes' OR v.urgency_level = 'Follow-up Needed')`;
+
+// The follow-up list. status 'open' (not yet done; soonest due first, those
+// without a date last) or 'done' (most recently done first, last 200).
+// Volunteers only see follow-ups on their own visits.
+async function listFollowUps({ isOwnOnly, userId, status }) {
+  const params = [];
+  const conditions = ['v.deleted_at IS NULL', NEEDS_FOLLOW_UP];
+  conditions.push(status === 'done' ? 'v.follow_up_done_at IS NOT NULL' : 'v.follow_up_done_at IS NULL');
+  if (isOwnOnly) {
+    params.push(userId);
+    conditions.push(`v.created_by = $${params.length}`);
+  }
+  const order =
+    status === 'done'
+      ? 'v.follow_up_done_at DESC LIMIT 200'
+      : `NULLIF(v.form_data->>'followUpDate', '') ASC NULLS LAST, v.created_at ASC`;
+
+  const { rows } = await pool.query(
+    `SELECT v.id, v.beneficiary_id, v.beneficiary_name, v.location, v.volunteer_name, v.visit_date,
+            v.urgency_level, v.form_data, v.follow_up_done_at, v.follow_up_note,
+            b.reference_number, done_by.name AS done_by_name,
+            later.id AS later_visit_id, later.visit_date AS later_visit_date
+     FROM visits v
+     LEFT JOIN beneficiaries b ON b.id = v.beneficiary_id
+     LEFT JOIN users done_by ON done_by.id = v.follow_up_done_by
+     LEFT JOIN LATERAL (
+       SELECT l.id, l.visit_date FROM visits l
+       WHERE l.beneficiary_id = v.beneficiary_id AND l.deleted_at IS NULL AND l.created_at > v.created_at
+       ORDER BY l.created_at DESC LIMIT 1
+     ) later ON true
+     WHERE ${conditions.join(' AND ')}
+     ORDER BY ${order}`,
+    params
+  );
+
+  return rows.map((r) => {
+    const f = r.form_data || {};
+    return {
+      visitId: r.id,
+      beneficiaryId: r.beneficiary_id,
+      beneficiaryName: r.beneficiary_name,
+      referenceNumber: f.referenceNumber || r.reference_number || null,
+      ward: f.ward || null,
+      location: r.location,
+      volunteerName: r.volunteer_name,
+      visitDate: r.visit_date,
+      urgent: r.urgency_level === 'Urgent',
+      dueDate: f.followUpDate || null,
+      concernTypes: Array.isArray(f.urgentConcernTypes) ? f.urgentConcernTypes : [],
+      concern: f.urgentConcernDescription || null,
+      plannedFollowUp: f.immediateFollowUp || null,
+      laterVisit: r.later_visit_id ? { id: r.later_visit_id, visitDate: r.later_visit_date } : null,
+      doneAt: r.follow_up_done_at,
+      doneByName: r.done_by_name,
+      note: r.follow_up_note,
+    };
+  });
+}
+
+// Marks a visit's follow-up done (note optional) or, with done = false,
+// reopens it. Returns false when the visit doesn't exist or never asked for
+// a follow-up.
+async function setFollowUpDone(id, { done, userId, note }) {
+  const { rows } = await pool.query(
+    `UPDATE visits v SET
+       follow_up_done_at = CASE WHEN $2 THEN now() ELSE NULL END,
+       follow_up_done_by = CASE WHEN $2 THEN $3::int ELSE NULL END,
+       follow_up_note = CASE WHEN $2 THEN $4 ELSE NULL END
+     WHERE v.id = $1 AND v.deleted_at IS NULL AND ${NEEDS_FOLLOW_UP}
+     RETURNING v.id`,
+    [id, done, userId, note || null]
+  );
+  return rows.length > 0;
 }
 
 // WHERE conditions shared by the visit list and the export, so a download
@@ -215,19 +296,40 @@ function summaryColumns(formData) {
   };
 }
 
-async function createV2({ createdBy, beneficiaryId, formVersion, formData }) {
+// clientSubmissionId (optional) is the phone's id for this submission; the
+// same id from the same user never creates a second visit.
+async function createV2({ createdBy, beneficiaryId, formVersion, formData, clientSubmissionId = null }) {
   const row = summaryColumns(formData);
   const columns = Object.keys(row);
   const values = Object.values(row);
-  const placeholders = values.map((_, i) => `$${i + 5}`);
+  const placeholders = values.map((_, i) => `$${i + 6}`);
 
-  const result = await pool.query(
-    `INSERT INTO visits (created_by, beneficiary_id, form_version, form_data, ${columns.join(', ')})
-     VALUES ($1, $2, $3, $4, ${placeholders.join(', ')})
-     RETURNING *`,
-    [createdBy, beneficiaryId, formVersion, formData, ...values]
+  try {
+    const result = await pool.query(
+      `INSERT INTO visits (created_by, beneficiary_id, form_version, form_data, client_submission_id, ${columns.join(', ')})
+       VALUES ($1, $2, $3, $4, $5, ${placeholders.join(', ')})
+       RETURNING *`,
+      [createdBy, beneficiaryId, formVersion, formData, clientSubmissionId, ...values]
+    );
+    return toVisit(result.rows[0]);
+  } catch (err) {
+    // The same submission arrived twice at once; hand back the first.
+    if (err.code === '23505' && clientSubmissionId) {
+      const existing = await findBySubmissionId(createdBy, clientSubmissionId);
+      if (existing) return existing;
+    }
+    throw err;
+  }
+}
+
+// A visit this user already sent with this submission id (even one since
+// deleted, so a late resend can't bring it back), or null.
+async function findBySubmissionId(createdBy, clientSubmissionId) {
+  const { rows } = await pool.query(
+    'SELECT * FROM visits WHERE created_by = $1 AND client_submission_id = $2',
+    [createdBy, clientSubmissionId]
   );
-  return toVisit(result.rows[0]);
+  return rows[0] ? toVisit(rows[0]) : null;
 }
 
 // Replaces the whole v2 form. Like update(), does not re-link the visit to a
@@ -348,6 +450,9 @@ module.exports = {
   create,
   update,
   createV2,
+  findBySubmissionId,
+  listFollowUps,
+  setFollowUpDone,
   updateV2,
   findFormById,
   findById,

@@ -671,6 +671,155 @@ describe('upload cleanup', () => {
   });
 });
 
+describe('sessions', () => {
+  const lifetimeHours = (token) => {
+    const { iat, exp } = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+    return (exp - iat) / 3600;
+  };
+
+  it('keeps field staff signed in for a week, office roles for the usual time', () => {
+    assert.equal(lifetimeHours(tokens.vol), 7 * 24);
+    assert.equal(lifetimeHours(tokens.coord), 7 * 24);
+    assert.equal(lifetimeHours(tokens.dir), 1);
+    assert.equal(lifetimeHours(tokens.admin), 1);
+  });
+
+  it('renews a valid session, and only a valid one', async () => {
+    const res = await t.request('POST', '/auth/refresh', tokens.dir);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.user.email, 'dir@bheco.org');
+    assert.equal((await t.request('GET', '/auth/me', res.body.token)).status, 200);
+    assert.equal((await t.request('GET', '/auth/me', tokens.dir)).status, 200, 'the old token keeps working until it expires');
+    assert.equal((await t.request('POST', '/auth/refresh')).status, 401);
+    assert.equal((await t.request('POST', '/auth/refresh', 'not-a-token')).status, 401);
+  });
+});
+
+describe('visits sent from the offline queue', () => {
+  it('records a visit sent twice only once', async () => {
+    const clientSubmissionId = '6f1c2a4e-3b7d-4c8e-9a1f-2b3c4d5e6f70';
+    const first = await t.request('POST', '/visits', tokens.vol, baseForm({ clientSubmissionId, visitDate: '2026-09-23' }));
+    assert.equal(first.status, 201);
+    const again = await t.request('POST', '/visits', tokens.vol, baseForm({ clientSubmissionId, visitDate: '2026-09-23' }));
+    assert.equal(again.status, 200);
+    assert.equal(again.body.id, first.body.id);
+    const { rows } = await t.db.query('SELECT COUNT(*)::int AS n FROM visits WHERE client_submission_id = $1', [clientSubmissionId]);
+    assert.equal(rows[0].n, 1);
+    // Another officer's submission id is theirs alone.
+    assert.equal((await t.request('POST', '/visits', tokens.coord, baseForm({ clientSubmissionId }))).status, 201);
+    assert.equal((await t.request('POST', '/visits', tokens.vol, baseForm({ clientSubmissionId: 'abc' }))).status, 400);
+  });
+
+  it('assigns the reference number of someone registered with no signal', async () => {
+    const res = await t.request('POST', '/visits', tokens.vol, baseForm({
+      referenceNumber: 'NEW-ID', beneficiaryName: 'Offline Newcomer', villageArea: 'Lanet',
+    }));
+    assert.equal(res.status, 201);
+    assert.match(res.body.formData.referenceNumber, /^BHECO-NK-\d{3}$/);
+    const lookup = await t.request('GET', `/beneficiaries/lookup?ref=${res.body.formData.referenceNumber}`, tokens.vol);
+    assert.equal(lookup.body.beneficiary.name, 'Offline Newcomer');
+    state.offlineVisit = res.body;
+  });
+
+  it('still asks about a possible duplicate before assigning one', async () => {
+    const blocked = await t.request('POST', '/visits', tokens.vol, baseForm({ referenceNumber: 'new-id' }));
+    assert.equal(blocked.status, 409);
+    assert.equal(blocked.body.possibleDuplicates[0].name, 'Mary Wanjiru');
+    const edit = await t.request('PATCH', `/visits/${state.offlineVisit.id}`, tokens.vol, baseForm({ referenceNumber: 'NEW-ID' }));
+    assert.equal(edit.status, 400, 'an existing visit keeps its number');
+  });
+});
+
+describe('follow-ups', () => {
+  const open = async (token) => (await t.request('GET', '/visits/follow-ups', token)).body;
+  const pending = async (token) => (await t.request('GET', '/stats/dashboard', token)).body.pendingFollowUps;
+
+  before(async () => {
+    const res = await t.request('POST', '/visits', tokens.vol, baseForm({
+      ...URGENT, followUpDate: '2026-01-05', urgentConcernDescription: 'No food in the house',
+    }));
+    assert.equal(res.status, 201);
+    state.followUpVisit = res.body;
+  });
+
+  it('lists open follow-ups, soonest due first, with what to follow up', async () => {
+    const list = await open(tokens.coord);
+    const mine = list.find((f) => f.visitId === state.followUpVisit.id);
+    assert.equal(mine.dueDate, '2026-01-05');
+    assert.equal(mine.concern, 'No food in the house');
+    assert.deepEqual(mine.concernTypes, ['Neglect']);
+    assert.equal(mine.referenceNumber, state.maryRef);
+    assert.equal(list[0].visitId, state.followUpVisit.id, 'earliest due date first');
+    assert.ok(list.some((f) => f.visitId === 1 && f.dueDate === null), 'original-form "Follow-up Needed" visits too');
+    assert.ok((await open(tokens.vol)).some((f) => f.visitId === state.followUpVisit.id));
+    assert.equal((await open(tokens.vol2)).length, 0, 'volunteers only see their own');
+  });
+
+  it('marks a follow-up done with a note, and reopens it', async () => {
+    const id = state.followUpVisit.id;
+    const before = await pending(tokens.coord);
+    const done = await t.request('POST', `/visits/${id}/follow-up`, tokens.coord, { note: 'Food delivered, family informed' });
+    assert.equal(done.status, 200);
+    assert.ok(done.body.followUpDoneAt);
+    assert.equal(done.body.followUpNote, 'Food delivered, family informed');
+    assert.ok(!(await open(tokens.coord)).some((f) => f.visitId === id));
+    const finished = (await t.request('GET', '/visits/follow-ups?status=done', tokens.coord)).body.find((f) => f.visitId === id);
+    assert.equal(finished.doneByName, 'Cora Coordinator');
+    assert.equal(await pending(tokens.coord), before - 1);
+
+    assert.equal((await t.request('DELETE', `/visits/${id}/follow-up`, tokens.vol)).status, 200, 'the officer who logged it may reopen');
+    assert.ok((await open(tokens.coord)).some((f) => f.visitId === id));
+    assert.equal(await pending(tokens.coord), before);
+  });
+
+  it('checks who may mark follow-ups and which visits have one', async () => {
+    const id = state.followUpVisit.id;
+    assert.equal((await t.request('POST', `/visits/${id}/follow-up`, tokens.vol2)).status, 404, "another volunteer's visit");
+    assert.equal((await t.request('POST', `/visits/${id}/follow-up`, tokens.dir)).status, 403);
+    assert.equal((await t.request('POST', `/visits/${state.maryVisit.id}/follow-up`, tokens.coord)).status, 400, 'no follow-up asked for');
+    assert.equal((await t.request('POST', '/visits/99999/follow-up', tokens.coord)).status, 404);
+    assert.equal((await t.request('POST', `/visits/${id}/follow-up`, tokens.coord, { note: 'x'.repeat(2001) })).status, 400);
+  });
+
+  it('counts follow-ups due this week, overdue ones included', async () => {
+    const stats = (await t.request('GET', '/stats/dashboard', tokens.coord)).body;
+    assert.ok(stats.followUpsDueThisWeek >= 1);
+    assert.ok(stats.followUpsDueThisWeek <= stats.pendingFollowUps);
+  });
+});
+
+describe('impact figures', () => {
+  it('gives the charts their data, from the answers on record', async () => {
+    const res = await t.request('GET', '/stats/impact', tokens.dir);
+    assert.equal(res.status, 200);
+    const { visitsByMonth, visitsByWard, urgentConcerns, supportProvided, gardenStages } = res.body;
+    assert.equal(visitsByMonth.length, 12);
+    assert.match(visitsByMonth[11].month, /^\d{4}-\d{2}$/);
+    assert.ok(visitsByWard.find((w) => w.label === 'Nakuru East').count > 0);
+    assert.ok(urgentConcerns.find((c) => c.label === 'Neglect').count >= 1);
+    assert.ok(supportProvided.find((s) => s.label === 'Food').count > 0);
+    assert.deepEqual(gardenStages.map((g) => g.label), ['Not started', 'Site identified', 'Garden Established', 'Crops Planted', 'Producing Food']);
+    assert.ok(gardenStages.find((g) => g.label === 'Site identified').count >= 1);
+    assert.equal((await t.request('GET', '/stats/impact', tokens.coord)).status, 200);
+    assert.equal((await t.request('GET', '/stats/impact', tokens.vol)).status, 403);
+  });
+});
+
+describe('beneficiary search', () => {
+  it('finds beneficiaries by name, reference number or village', async () => {
+    const find = async (q, token = tokens.dir) => (await t.request('GET', `/beneficiaries?q=${encodeURIComponent(q)}`, token)).body;
+    assert.ok((await find('newcomer')).every((b) => b.name === 'Offline Newcomer'));
+    const byRef = await find(state.maryRef.toLowerCase());
+    assert.equal(byRef.length, 1);
+    assert.equal(byRef[0].name, 'Mary Wanjiru');
+    assert.equal(byRef[0].ward, 'Nakuru East');
+    assert.ok(byRef[0].openFollowUps >= 1);
+    assert.ok((await find('lanet')).some((b) => b.name === 'Offline Newcomer'));
+    assert.equal((await find('%')).length, 0);
+    assert.equal((await find('newcomer', tokens.vol2)).length, 0, 'volunteers stay scoped');
+  });
+});
+
 describe('misc', () => {
   it('404s unknown routes and 413s oversized bodies', async () => {
     assert.equal((await t.request('GET', '/nope', tokens.dir)).status, 404);

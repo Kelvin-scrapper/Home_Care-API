@@ -157,3 +157,16 @@ CREATE TABLE IF NOT EXISTS reference_sequences (
   code TEXT PRIMARY KEY,
   last_number INTEGER NOT NULL
 );
+
+-- A visit recorded offline is sent by the phone once it reconnects, and may
+-- be sent again if the reply was lost. The phone's id for the submission
+-- makes the second send return the visit already created.
+ALTER TABLE visits ADD COLUMN IF NOT EXISTS client_submission_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_visits_client_submission_id
+  ON visits (created_by, client_submission_id) WHERE client_submission_id IS NOT NULL;
+
+-- Follow-ups: a visit that asked for one stays on the follow-up list until
+-- someone marks it done.
+ALTER TABLE visits ADD COLUMN IF NOT EXISTS follow_up_done_at TIMESTAMPTZ;
+ALTER TABLE visits ADD COLUMN IF NOT EXISTS follow_up_done_by INTEGER REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE visits ADD COLUMN IF NOT EXISTS follow_up_note TEXT;

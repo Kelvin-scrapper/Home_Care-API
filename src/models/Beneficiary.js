@@ -81,21 +81,42 @@ async function findOrCreateByReference({ referenceNumber, name, location, age, w
   }
 }
 
-// Beneficiary directory with visit counts. Volunteers only see beneficiaries
-// they've personally visited; coordinators/directors/admins see everyone.
-async function list({ isOwnOnly, userId }) {
+// Beneficiary directory with visit counts, most recently visited first.
+// Volunteers only see beneficiaries they've personally visited (and only
+// their own visits are counted); coordinators/directors/admins see everyone.
+// q (optional) matches name, reference number or village, partially.
+async function list({ isOwnOnly, userId, q }) {
+  const params = [];
+  const conditions = [];
+  if (isOwnOnly) {
+    params.push(userId);
+    conditions.push(`v.created_by = $${params.length}`);
+  }
+  if (q) {
+    params.push(`%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
+    const p = `$${params.length}`;
+    conditions.push(`(b.name ILIKE ${p} OR b.reference_number ILIKE ${p} OR b.location ILIKE ${p})`);
+  }
   const { rows } = await pool.query(
     `SELECT b.id, b.name, b.location, b.age, b.weight,
             b.time_in_community AS "timeInCommunity",
             b.reference_number AS "referenceNumber",
             COUNT(v.id)::int AS "visitCount",
-            MAX(v.created_at) AS "lastVisitAt"
+            MAX(v.created_at) AS "lastVisitAt",
+            (ARRAY_AGG(v.visit_date ORDER BY v.created_at DESC))[1] AS "lastVisitDate",
+            (ARRAY_AGG(NULLIF(v.form_data->>'ward', '') ORDER BY v.created_at DESC)
+               FILTER (WHERE NULLIF(v.form_data->>'ward', '') IS NOT NULL))[1] AS ward,
+            BOOL_OR(v.urgency_level = 'Urgent') AS "everUrgent",
+            COUNT(v.id) FILTER (
+              WHERE v.follow_up_done_at IS NULL
+                AND (v.form_data->>'followUpRequired' = 'Yes' OR v.urgency_level = 'Follow-up Needed')
+            )::int AS "openFollowUps"
      FROM beneficiaries b
      JOIN visits v ON v.beneficiary_id = b.id AND v.deleted_at IS NULL
-     ${isOwnOnly ? 'WHERE v.created_by = $1' : ''}
+     ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
      GROUP BY b.id
      ORDER BY "lastVisitAt" DESC`,
-    isOwnOnly ? [userId] : []
+    params
   );
   return rows;
 }
